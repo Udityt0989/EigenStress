@@ -56,12 +56,14 @@ import threading
 _GMSH_LOCK = threading.Lock()
 
 
-def mesh_polygon(poly, fillets=None, refine=None, h_global=5.0, verbose=False, circles=None, poly_holes=None):
+def mesh_polygon(poly, fillets=None, refine=None, h_global=5.0, verbose=False, circles=None, poly_holes=None,
+                 hole_refine=None):
     with _GMSH_LOCK:
-        return _mesh_polygon(poly, fillets, refine, h_global, verbose, circles, poly_holes)
+        return _mesh_polygon(poly, fillets, refine, h_global, verbose, circles, poly_holes, hole_refine)
 
 
-def _mesh_polygon(poly, fillets=None, refine=None, h_global=5.0, verbose=False, circles=None, poly_holes=None):
+def _mesh_polygon(poly, fillets=None, refine=None, h_global=5.0, verbose=False, circles=None, poly_holes=None,
+                  hole_refine=None):
     """
     poly       : CCW list of vertices
     fillets    : {vertex_index: radius}
@@ -124,8 +126,10 @@ def _mesh_polygon(poly, fillets=None, refine=None, h_global=5.0, verbose=False, 
         arcs = [geo.addCircleArc(q[k], pc, q[(k + 1) % len(q)]) for k in range(len(q))]
         loops.append(geo.addCurveLoop(arcs))
         hole_curves.append((arcs, min(h_global, h_hole)))
+    hole_tags = []
     for hole in poly_holes:
         pts = [add_pt(np.asarray(p, float)) for p in hole]
+        hole_tags.append(pts)
         lines = [geo.addLine(pts[k], pts[(k + 1) % len(pts)]) for k in range(len(pts))]
         loops.append(geo.addCurveLoop(lines))
     geo.addPlaneSurface(loops)
@@ -143,8 +147,9 @@ def _mesh_polygon(poly, fillets=None, refine=None, h_global=5.0, verbose=False, 
         gmsh.model.mesh.field.setNumber(ft, "DistMin", hs)
         gmsh.model.mesh.field.setNumber(ft, "DistMax", 3 * h_global)
         fields.append(ft)
-    for vi, h_loc in refine:
-        kind, tag = vertex_entity[vi]
+    refine_items = [(vertex_entity[vi], h_loc) for vi, h_loc in refine]
+    refine_items += [(("point", hole_tags[k][i]), h_loc) for k, i, h_loc in (hole_refine or [])]
+    for (kind, tag), h_loc in refine_items:
         fd = gmsh.model.mesh.field.add("Distance")
         if kind == "point":
             gmsh.model.mesh.field.setNumbers(fd, "PointsList", [tag])
@@ -209,25 +214,14 @@ def _arc_facets(m, c, r, a0, a1):
     return np.intersect1d(f, m.boundary_facets())
 
 
-def solve_plane_stress(m, fixed_edges, traction_edges, E=E_STEEL, nu=NU_STEEL,
-                       fixed_arcs=(), radial_arcs=(), bearing_arcs=()):
-    """
-    fixed_edges    : list of (p, q) segments, fully clamped
-    traction_edges : list of (p, q, (tx, ty)) uniform traction in MPa (N/mm^2 per unit thickness)
-    fixed_arcs     : list of (c, r, a0, a1) hole arcs fully clamped (bolted / press-fit hole)
-    radial_arcs    : list of (c, r, a0, a1) hole arcs held only radially (frictionless pin contact)
-    bearing_arcs   : list of (c, r, (Fx, Fy)) bolt bearing load: force per unit thickness (N/mm),
-                     cosine pressure on the half of the hole the bolt pulls toward
-    Returns dict of averaged nodal stresses (sx, sy, txy, vm) on mesh vertices.
-    """
-    e = ElementVector(ElementTriP2())
-    ib = Basis(m, e)
-    lam, mu = lame_parameters(E, nu)
-    lam = 2 * lam * mu / (lam + 2 * mu)             # plane-stress modified Lame constant
-    K = asm(linear_elasticity(lam, mu), ib)
-
+def boundary_conditions(m, ib, e, fixed_edges, traction_edges, fixed_arcs=(), radial_arcs=(), bearing_arcs=(),
+                        E=E_STEEL):
+    """Load vector f, clamped DOFs D and pin penalty matrix (or None) for any vector element `e`.
+    Shared by the stress solver (P2) and the topology optimiser (P1)."""
+    import scipy.sparse as sp
+    ndof = ib.N
     tol = 1e-6 * np.ptp(m.p)
-    f = np.zeros(K.shape[0])
+    f = np.zeros(ndof)
     for p, q, (tx, ty) in traction_edges:
         facets = m.facets_satisfying(lambda x, p=p, q=q: _on_segment(x, p, q, tol))
         fb = FacetBasis(m, e, facets=facets)
@@ -266,22 +260,46 @@ def solve_plane_stress(m, fixed_edges, traction_edges, E=E_STEEL, nu=NU_STEEL,
     D = np.unique(np.concatenate(D)) if D else np.array([], dtype=int)
 
     # frictionless pin: stiff radial springs at every DOF location on the contact arc (penalty method)
+    Kpen = None
     if radial_arcs:
-        import scipy.sparse as sp
         kpen = 1e4 * E
         rows, cols, vals = [], [], []
         for c, r, a0, a1 in radial_arcs:
             dofs = ib.get_dofs(facets=_arc_facets(m, c, r, a0, a1))
-            ux_ = np.concatenate([dofs.nodal["u^1"], dofs.facet["u^1"]])
-            uy_ = np.concatenate([dofs.nodal["u^2"], dofs.facet["u^2"]])
+            ux_ = np.concatenate([dofs.nodal["u^1"], dofs.facet.get("u^1", np.array([], int))]).astype(int)
+            uy_ = np.concatenate([dofs.nodal["u^2"], dofs.facet.get("u^2", np.array([], int))]).astype(int)
             loc = ib.doflocs[:, ux_]
             n = loc - np.asarray(c, float)[:, None]
             n /= np.linalg.norm(n, axis=0)
             for a, b, w_ in ((ux_, ux_, n[0] * n[0]), (ux_, uy_, n[0] * n[1]),
                              (uy_, ux_, n[1] * n[0]), (uy_, uy_, n[1] * n[1])):
                 rows.append(a); cols.append(b); vals.append(kpen * w_)
-        K = K + sp.coo_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
-                              shape=K.shape).tocsr()
+        Kpen = sp.coo_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+                             shape=(ndof, ndof)).tocsr()
+    return f, D, Kpen
+
+
+def solve_plane_stress(m, fixed_edges, traction_edges, E=E_STEEL, nu=NU_STEEL,
+                       fixed_arcs=(), radial_arcs=(), bearing_arcs=()):
+    """
+    fixed_edges    : list of (p, q) segments, fully clamped
+    traction_edges : list of (p, q, (tx, ty)) uniform traction in MPa (N/mm^2 per unit thickness)
+    fixed_arcs     : list of (c, r, a0, a1) hole arcs fully clamped (bolted / press-fit hole)
+    radial_arcs    : list of (c, r, a0, a1) hole arcs held only radially (frictionless pin contact)
+    bearing_arcs   : list of (c, r, (Fx, Fy)) bolt bearing load: force per unit thickness (N/mm),
+                     cosine pressure on the half of the hole the bolt pulls toward
+    Returns dict of averaged nodal stresses (sx, sy, txy, vm) on mesh vertices.
+    """
+    e = ElementVector(ElementTriP2())
+    ib = Basis(m, e)
+    lam, mu = lame_parameters(E, nu)
+    lam = 2 * lam * mu / (lam + 2 * mu)             # plane-stress modified Lame constant
+    K = asm(linear_elasticity(lam, mu), ib)
+
+    f, D, Kpen = boundary_conditions(m, ib, e, fixed_edges, traction_edges, fixed_arcs, radial_arcs,
+                                     bearing_arcs, E)
+    if Kpen is not None:
+        K = K + Kpen
     if len(D):
         u = solve(*condense(K, f, D=D))
     else:

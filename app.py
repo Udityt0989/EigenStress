@@ -22,6 +22,7 @@ from fe2d import interior_angles, signed_area
 from geometry_io import read_dxf, write_sample_dxfs
 from corner_tools import corner_features
 from sing_tool import solve_two_meshes, analyse, max_regular_stress, predict, scan_holes
+from topopt import optimise, extract_shape, write_dxf
 
 HERE = Path(__file__).parent
 SAMPLES = HERE / "samples"
@@ -282,6 +283,25 @@ def build_part(geom, edges, supports, loads, thickness, E, nu, rho, hole_bc=None
             "E": E, "nu": nu, "corner_radius": rho}
 
 
+def map_edges_to(edges, segs, tol=None):
+    """Edges of a (new) outline that lie on any of the given old segments [(p, q), ...]."""
+    out = []
+    for idx, e in enumerate(edges):
+        pts = np.array([e["segs"][0][0]] + [q for _, q in e["segs"]])
+        L = e["length"]
+        tl = tol if tol is not None else max(0.02 * L, 1e-3)
+        for p, q in segs:
+            p, q = np.asarray(p, float), np.asarray(q, float)
+            d = q - p
+            Ld = np.linalg.norm(d)
+            tt = np.clip(((pts - p) @ d) / (Ld * Ld), 0, 1)
+            dist = np.linalg.norm(pts - (p + tt[:, None] * d), axis=1)
+            if dist.max() < tl:
+                out.append(idx)
+                break
+    return out
+
+
 def support_problem(supports, hole_bc):
     """Return a message if the supports cannot hold the part still (rigid-body mechanism), else None."""
     full = len(supports) + sum(1 for b in hole_bc.values() if b["type"] == "fixed")
@@ -312,9 +332,17 @@ def result_figure(part, sols, flags, regular, hole_summary=(), mat=None):
     ax.set_aspect("equal")
     ax.axis("off")
     box = dict(boxstyle="square,pad=0.35", fc=BG, ec="#2a2a2a", lw=1)
-    for _, r in flags[flags.singular].iterrows():
+    sing = flags[flags.singular == True]
+    sh = sing[sing.type == "sharp re-entrant corner"]
+    pr_col = sh.get("predicted_real_stress", pd.Series(0.0, index=sh.index)).fillna(0)
+    top = set(pr_col.sort_values(ascending=False).index[:5])       # label only the 5 most stressed corners
+    many = len(sing) > 8
+    for idx, r in sing.iterrows():
         geo = r.type == "sharp re-entrant corner"
-        ax.plot(r.x, r.y, "o", ms=14, mfc="none", mec=C_SING if geo else "#8c8c8c", mew=2)
+        ax.plot(r.x, r.y, "o", ms=10 if many else 14, mfc="none", mec=C_SING if geo else "#8c8c8c",
+                mew=1.6 if many else 2)
+        if many and idx not in top:
+            continue
         lab = r.label
         if geo:
             lab = f"{r.label} SINGULARITY · FE {r.fe_stress_fine:.0f} (NOT REAL)"
@@ -581,7 +609,17 @@ with st.sidebar:
 
 # ------------------------------------------------------------------ geometry
 try:
-    if up is not None:
+    if ss.get("opt_geom") is not None:
+        geom = ss.opt_geom["geom"]
+        name = ss.opt_geom["name"]
+        gkey = ss.opt_geom["key"]
+        with st.sidebar:
+            st.markdown('<p class="eyebrow">→ showing the OPTIMISED shape</p>', unsafe_allow_html=True)
+            if st.button("Back to the original drawing", width="stretch"):
+                ss.opt_geom = None
+                ss.geom_key = None
+                st.rerun()
+    elif up is not None:
         raw = up.getvalue()
         geom = read_dxf(io.BytesIO(raw), scale)
         name = up.name
@@ -600,7 +638,21 @@ except Exception as e:
 if ss.geom_key != gkey:
     ss.supports, ss.forces, ss.hole_fix, ss.results, ss.geom_key = set(), [], {}, None, gkey
     ss.sel_ms, ss.pending_toggle, ss.force_count = [], None, 0
+    ss.topo = None
 edges = edge_groups(geom["outline"])
+if ss.get("pending_bc") is not None:                       # supports / loads carried over to an optimised shape
+    pb = ss.pending_bc
+    ss.pending_bc = None
+    n_e_new = len(edges)
+    ss.hole_fix = {pb["hole_map"][j]: b for j, b in pb["hole_fix"].items() if j in pb["hole_map"]}
+    ss.supports = set(map_edges_to(edges, pb["fixed_segs"]))
+    ss.forces, ss.force_count = [], 0
+    for fo in pb["forces"]:
+        tg = [n_e_new + pb["hole_map"][t] for t in fo["holes"] if t in pb["hole_map"]]
+        tg += map_edges_to(edges, fo["edge_segs"])
+        if tg:
+            ss.force_count += 1
+            ss.forces.append({"name": f"F{ss.force_count}", "targets": tg, "F": fo["F"], "mode": fo["mode"]})
 
 st.markdown('<p class="eyebrow">FEM singularity finder · real-stress predictor</p>', unsafe_allow_html=True)
 st.title("EigenStress")
@@ -704,10 +756,28 @@ with col_ctrl:
     if rows:
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         if ss.forces:
-            d1, d2 = st.columns([2, 1])
-            gone = d1.selectbox("Delete a force", [f["name"] for f in ss.forces], label_visibility="collapsed")
-            if d2.button("Delete force", width="stretch"):
-                ss.forces = [f for f in ss.forces if f["name"] != gone]
+            with st.form("edit_force_form", border=True):
+                st.write("Edit or delete an applied force")
+                names = [f["name"] for f in ss.forces]
+                d0, d1, d2 = st.columns([1, 1, 1])
+                pick = d0.selectbox("Force", names)
+                cur = next(f for f in ss.forces if f["name"] == pick)
+                efx = d1.number_input("New Fx (N)", value=None, format="%g", placeholder=f"{cur['F'][0]:g}")
+                efy = d2.number_input("New Fy (N)", value=None, format="%g", placeholder=f"{cur['F'][1]:g}")
+                st.caption("Leave a box empty to keep its current value (shown in grey).")
+                b1, b2 = st.columns(2)
+                upd = b1.form_submit_button("Update force", width="stretch")
+                dele = b2.form_submit_button("Delete force", width="stretch")
+            if upd or dele:
+                f_ = next(f for f in ss.forces if f["name"] == pick)
+                if dele:
+                    ss.forces = [f for f in ss.forces if f["name"] != pick]
+                else:
+                    nf = (float(efx) if efx is not None else f_["F"][0], float(efy) if efy is not None else f_["F"][1])
+                    if nf == (0.0, 0.0):
+                        st.warning("Force is zero; use Delete instead.")
+                        st.stop()
+                    f_["F"] = nf
                 ss.results = None
                 st.rerun()
         hf = hole_forces_from(ss.forces, n_e)
@@ -768,13 +838,17 @@ if run:
         except Exception as e:
             st.error(f"Solve failed: {e}")
             st.stop()
-    ss.results = {"part": part, "sols": sols}
+    ss.results = {"part": part, "sols": sols,
+                  "used": [f"{f['name']} on {', '.join(lab(t) for t in f['targets'])}: "
+                           f"Fx {f['F'][0]:g} N, Fy {f['F'][1]:g} N ({f['mode']})" for f in ss.forces]}
     ss.probes = []
     ss.run_id = ss.get("run_id", 0) + 1
 
 if ss.results:
     part, sols = ss.results["part"], ss.results["sols"]
     part["corner_radius"] = rho
+    if ss.results.get("used"):
+        st.markdown('<div class="note">SOLVED WITH → ' + " · ".join(ss.results["used"]) + "</div>", unsafe_allow_html=True)
     model = load_model()
     flags = analyse(part, sols, model)
     hole_rows, hole_summary = scan_holes(part, sols)
@@ -913,7 +987,13 @@ if ss.results:
     with right:
         st.markdown("### Sharp corners → real stress")
         if len(sharp):
-            for _, r in sharp.iterrows():
+            order = sharp.assign(_k=sharp.get("predicted_real_stress", pd.Series(0.0, index=sharp.index)).fillna(0)) \
+                .sort_values("_k", ascending=False)
+            MAXCARDS = 5
+            if len(sharp) > MAXCARDS:
+                st.caption(f"{len(sharp)} sharp corners. Showing the {MAXCARDS} with the highest real stress; "
+                           "all are in the table below.")
+            for _, r in order.head(MAXCARDS).iterrows():
                 pr_ = r.get("predicted_real_stress", np.nan)
                 ml_line = (f'<div class="ml">ML PREDICTED REAL STRESS · r = {r.corner_radius:g} mm'
                            f'<span class="big">{pr_:.0f} MPa</span></div>') if np.isfinite(pr_) else \
@@ -936,6 +1016,7 @@ if ss.results:
                     f'{r.fe_stress_fine:.0f} MPa as the mesh is halved (×{r.refine_ratio:.2f}). '
                     f'Not a real stress: it keeps rising with every refinement.</div>'
                     f'{ml_line}{yld}</div>', unsafe_allow_html=True)
+            sharp = order.drop(columns="_k")
             t = pd.DataFrame({
                 "point": list(sharp.label),
                 "FE singular": sharp.fe_stress_fine.round(0),
@@ -986,6 +1067,113 @@ if ss.results:
     d1.download_button("Download report (Markdown)", rep, file_name=f"{Path(name).stem}_singularity_report.md")
     d2.download_button("Download results (CSV)", flags.to_csv(index=False),
                        file_name=f"{Path(name).stem}_singular_points.csv")
+
+# ------------------------------------------------------------------ 05 · topology optimisation
+st.divider()
+st.subheader("05 · Optimise shape")
+st.markdown('<p class="eyebrow">Topology optimisation (SIMP, minimum compliance): keeps the stiffest '
+            'layout of material for a target volume, using the supports and loads above. Material around '
+            'loaded / fixed holes and edges is always kept.</p>', unsafe_allow_html=True)
+if not ready:
+    st.markdown('<p class="eyebrow">→ Set supports and loads first (section 03)</p>', unsafe_allow_html=True)
+else:
+    o1, o2, o3 = st.columns(3)
+    vf = o1.slider("Material to keep", 0.15, 0.8, 0.4, 0.05, key="to_vf",
+                   help="Fraction of the design area kept after optimisation.")
+    res_q = o2.select_slider("Resolution", ["coarse", "medium", "fine"], value="medium", key="to_res",
+                             help="Finer = more detailed shape, slower (about 5-40 s).")
+    start = o3.radio("Start from", ["solid", "current"], key="to_start", horizontal=True,
+                     format_func={"solid": "Solid outline", "current": "Current shape"}.get,
+                     help="Solid outline ignores existing cutouts (bolt holes are always kept).")
+    if st.button("Optimise", key="to_run"):
+        part0 = build_part(geom, edges, ss.supports, loads, thickness, E, nu, rho, hole_bc)
+        if start == "solid":
+            part0 = dict(part0)
+            part0["poly_holes"] = []
+        from shapely.geometry import Polygon as _Pg
+        design_area = _Pg(geom["outline"]).area - sum(np.pi * r_ ** 2 for _, r_ in geom["circles"])
+        n_target = {"coarse": 5000, "medium": 10000, "fine": 20000}[res_q]
+        hsel = float(np.sqrt(max(design_area, 1e-9) / (0.43 * n_target)))   # ~equilateral triangles
+        bar = st.progress(0.0, text="Optimising…")
+
+        def cb(i, n, c, v):
+            bar.progress(i / n, text=f"Iteration {i}/{n} · compliance {c:.4g} · volume {v:.2f}")
+        try:
+            from sing_tool import min_wall
+            if part0.get("poly_holes"):
+                hsel = min(hsel, max(min_wall(part0) / 2.5, hsel / 3))
+            tres = optimise(part0, volfrac=vf, h=hsel, callback=cb)
+            tgeo, hmap = extract_shape(tres, part0)
+            if not tgeo.get("connected", True):
+                st.warning("The optimised layout splits into separate pieces at this resolution / material "
+                           "fraction, so it cannot be analysed as one part. Try more material or a finer resolution.")
+            ss.topo = {"res": tres, "geo": tgeo, "hole_map": hmap, "part": part0, "vf": vf}
+        except Exception as ex:
+            st.error(f"Optimisation failed: {ex}")
+        bar.empty()
+    if ss.get("topo"):
+        T = ss.topo
+        tres, tgeo = T["res"], T["geo"]
+        hst = pd.DataFrame(tres["history"])
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("Material kept", f"{100 * tgeo['volume_kept']:.0f}%")
+        t2.metric("Mass saved", f"{100 * (1 - tgeo['volume_kept']):.0f}%")
+        rel = tres["c_full"] / hst.compliance.iloc[-1]
+        t3.metric("Stiffness vs solid", f"{100 * rel:.0f}%",
+                  help="Compliance of the full solid part divided by the optimised compliance "
+                       "(100% = as stiff as the solid part).")
+        t4.metric("Iterations", len(hst))
+        cA, cB = st.columns(2)
+        mo = tres["mesh"]
+        figd, axd = plt.subplots(figsize=(7, 5), facecolor=BG)
+        axd.set_facecolor(BG)
+        axd.tripcolor(mo.p[0], mo.p[1], mo.t.T, facecolors=tres["density"], cmap="gray", vmin=0, vmax=1)
+        axd.set_aspect("equal"); axd.axis("off")
+        axd.set_title("DENSITY (WHITE = MATERIAL)", color="#8c8c8c", fontsize=9, family="monospace", loc="left")
+        cA.pyplot(figd, width="stretch")
+        figs, axs = plt.subplots(figsize=(7, 5), facecolor=BG)
+        axs.set_facecolor(BG)
+        o_ = np.array(tgeo["outline"] + [tgeo["outline"][0]])
+        axs.fill(o_[:, 0], o_[:, 1], color="#5a5a5a"); axs.plot(o_[:, 0], o_[:, 1], color=FG, lw=1)
+        for hh in tgeo["poly_holes"]:
+            hh = np.array(hh + [hh[0]]); axs.fill(hh[:, 0], hh[:, 1], color=BG); axs.plot(hh[:, 0], hh[:, 1], color=FG, lw=1)
+        for c_, r_ in tgeo["circles"]:
+            tt = np.linspace(0, 2 * np.pi, 60)
+            axs.fill(c_[0] + r_ * np.cos(tt), c_[1] + r_ * np.sin(tt), color=BG)
+            axs.plot(c_[0] + r_ * np.cos(tt), c_[1] + r_ * np.sin(tt), color=FG, lw=1)
+        axs.set_aspect("equal"); axs.axis("off")
+        axs.set_title(f"EXTRACTED SHAPE · {len(tgeo['poly_holes'])} CUTOUTS", color="#8c8c8c", fontsize=9,
+                      family="monospace", loc="left")
+        cB.pyplot(figs, width="stretch")
+        st.caption("The extracted shape keeps sharp corners where struts meet. Send it to EigenStress to see which "
+                   "of them are singular and what their real stress is for your machining radius, then fillet "
+                   "them in CAD.")
+        import tempfile, os
+        fd, tmpdxf = tempfile.mkstemp(suffix=".dxf"); os.close(fd)
+        write_dxf(tgeo, tmpdxf)
+        dxf_bytes = open(tmpdxf, "rb").read(); os.remove(tmpdxf)
+        b1, b2 = st.columns(2)
+        b1.download_button("Download optimised shape (DXF)", dxf_bytes,
+                           file_name=f"{Path(name).stem}_optimised_{int(100 * T['vf'])}pct.dxf")
+        if b2.button("Analyse optimised shape with EigenStress →", width="stretch"):
+            n_e_old = len(edges)
+            seg_of = lambda i: [(tuple(p), tuple(q)) for p, q in edges[i]["segs"]]
+            fo_list = []
+            for fo in ss.forces:
+                e_t = [t for t in fo["targets"] if t < n_e_old]
+                h_t = [t - n_e_old for t in fo["targets"] if t >= n_e_old]
+                F_ = fo["F"]
+                mode = fo["mode"]
+                if mode == "each" and e_t:                 # keep the same total force on the edges
+                    F_ = (F_[0] * len(e_t), F_[1] * len(e_t)) if not h_t else F_
+                    mode = "split" if not h_t else mode
+                fo_list.append({"F": F_, "mode": mode, "holes": h_t,
+                                "edge_segs": [sg for i in e_t for sg in seg_of(i)]})
+            ss.pending_bc = {"hole_map": T["hole_map"], "hole_fix": dict(ss.hole_fix),
+                             "fixed_segs": [sg for i in ss.supports for sg in seg_of(i)], "forces": fo_list}
+            ss.opt_geom = {"geom": tgeo, "name": f"{Path(name).stem} · optimised {int(100 * T['vf'])}%",
+                           "key": f"opt_{gkey}_{T['vf']}_{len(tgeo['outline'])}_{len(tgeo['poly_holes'])}"}
+            st.rerun()
 
 with st.expander("How it works"):
     st.markdown(

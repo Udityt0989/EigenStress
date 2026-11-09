@@ -49,7 +49,7 @@ def summary(name, e):
 def main():
     parts = []
     for f in ("dataset.csv", "dataset_notch.csv", "dataset_bracket2.csv",
-              "dataset_stepped.csv", "dataset_bracket_bigr.csv", "dataset_notch_bigr.csv"):
+              "dataset_stepped.csv", "dataset_bracket_bigr.csv", "dataset_notch_bigr.csv", "dataset_window.csv"):
         try:
             d = pd.read_csv(f)
         except FileNotFoundError:

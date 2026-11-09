@@ -84,8 +84,48 @@ MODEL_BETA_RANGE = (190.0, 330.0)
 
 
 def part_holes(part):
-    return ([((c[0][0], c[0][1]), c[1]) for c in part.get("circles", [])],
-            [[tuple(p) for p in h] for h in part.get("poly_holes", [])])
+    """Circles and polygonal cutouts. Cutout rings are returned CLOCKWISE (material on the left), so the
+    corner tools give the MATERIAL angle at each cutout vertex, exactly as for the CCW outline."""
+    holes = []
+    for h in part.get("poly_holes", []):
+        h = [tuple(p) for p in h]
+        if signed_area(h) > 0:
+            h = h[::-1]
+        holes.append(h)
+    return [((c[0][0], c[0][1]), c[1]) for c in part.get("circles", [])], holes
+
+
+def _ring_seg_dists(P, ring, skip=()):
+    R_ = np.asarray(ring, float)
+    n = len(R_)
+    return [_seg_dist(P, R_[j], R_[(j + 1) % n]) for j in range(n) if j not in skip]
+
+
+def _seg_dist(P, a, b):
+    ab = b - a
+    t = np.clip((P - a) @ ab / (ab @ ab), 0, 1)
+    return float(np.linalg.norm(P - (a + t * ab)))
+
+
+def cutout_corners(part):
+    """Sharp material corners on polygonal cutouts: list of (k, i, beta, ell)."""
+    circles, holes = part_holes(part)
+    outline = np.asarray(part["poly"], float)
+    out = []
+    for k, ring in enumerate(holes):
+        beta = interior_angles(ring)
+        n = len(ring)
+        for i, b in enumerate(beta):
+            if b <= CANDIDATE_ANGLE:
+                continue
+            P = np.asarray(ring[i], float)
+            d = _ring_seg_dists(P, ring, skip=(i, (i - 1) % n)) + _ring_seg_dists(P, outline)
+            for kk, other in enumerate(holes):
+                if kk != k:
+                    d += _ring_seg_dists(P, other)
+            d += [np.linalg.norm(P - np.asarray(c)) - r for c, r in circles]
+            out.append((k, i, float(b), float(min(d))))
+    return out
 
 
 HOLE_DIVS = {"coarse": 48, "fine": 96}   # elements around each hole circumference
@@ -164,21 +204,26 @@ def solve_two_meshes(part, h_fine_div=40, h_coarse_div=20):
     size = np.ptp(np.vstack(poly), axis=0).max()
     verts = refine_vertices(part)
     ells = {i: corner_length(poly, i, circles, poly_holes) for i in range(len(poly))}
+    cuts = cutout_corners(part)
     hg = size / 15
     if verts:
         hg = min(hg, min(ells[i] for i in verts) / 2)
+    if cuts:
+        hg = min(hg, max(min(c_[3] for c_ in cuts) / 2, size / 400))
     hg = min(hg, max(min_wall(part) / 3, size / 400))      # at least ~3 elements across the thinnest wall
     res = {}
     fixed_arcs, radial_arcs, bearing_arcs, splits = hole_fixture_arcs(part)
     for tag, div in (("coarse", h_coarse_div), ("fine", h_fine_div)):
         hs = {i: ells[i] / div for i in verts}
+        hh = {(k, i): ell / div for k, i, _, ell in cuts}
         circ = [(c, r, splits.get(j, []), 2 * np.pi * r / HOLE_DIVS[tag]) for j, (c, r) in enumerate(circles)]
-        m = mesh_polygon(poly, refine=list(hs.items()), h_global=hg, circles=circ, poly_holes=poly_holes)
+        m = mesh_polygon(poly, refine=list(hs.items()), h_global=hg, circles=circ, poly_holes=poly_holes,
+                         hole_refine=[(k, i, h_) for (k, i), h_ in hh.items()])
         s = solve_plane_stress(m, [tuple(map(tuple, e)) for e in part.get("fixed", [])],
                                [(e[0], e[1], tuple(e[2])) for e in part.get("traction", [])],
                                E=part.get("E", 210000.0), nu=part.get("nu", 0.3),
                                fixed_arcs=fixed_arcs, radial_arcs=radial_arcs, bearing_arcs=bearing_arcs)
-        res[tag] = {"m": m, "s": s, "h": hs, "ell": ells, "sampler": sampler_from_mesh(m, s),
+        res[tag] = {"m": m, "s": s, "h": hs, "ell": ells, "hole_h": hh, "sampler": sampler_from_mesh(m, s),
                     "xy": m.p.T, "vm": s["vm"]}
     return res
 
@@ -236,6 +281,41 @@ def analyse(part, sols, model=None):
             row["type"] = "support / load artefact"
             row["note"] = ("idealised clamp or load edge - not a physical stress; "
                            "read stress away from it or model the real support")
+        rows.append(row)
+
+    # ---- sharp corners on polygonal cutouts (e.g. where struts meet in an optimised part)
+    _, holes = part_holes(part)
+    for k, i, b, ell in cutout_corners(part):
+        ring = holes[k]
+        P = np.asarray(ring[i], float)
+        v_c, v_f = node_value(c["xy"], c["vm"], P), node_value(f["xy"], f["vm"], P)
+        ratio = v_f / max(v_c, 1e-9)
+        rising = ratio > RATIO_THRESHOLD and v_f > 1e-3 * scale
+        row = {"vertex": np.nan, "label": f"C{k}.{i}", "x": P[0], "y": P[1], "angle_deg": round(b, 1),
+               "fe_stress_coarse": v_c, "fe_stress_fine": v_f, "refine_ratio": ratio,
+               "singular": bool(rising), "ell": ell}
+        if not rising:
+            row["type"] = "regular"
+            rows.append(row)
+            continue
+        row["type"] = "sharp re-entrant corner"
+        row["williams_lambda"] = williams_lambda(b)
+        rho = rad_default
+        row["corner_radius"] = rho
+        hmap = f.get("hole_h", {}) or {}
+        h = hmap.get((k, i), f["h"][0] if isinstance(f["h"], (list, tuple)) else min(f["h"].values()))
+        feats = corner_features(f["sampler"], ring, i, h, ell=ell)
+        notes = []
+        if not (MODEL_BETA_RANGE[0] <= b <= MODEL_BETA_RANGE[1]):
+            notes.append("corner angle outside trained range (190-330 deg)")
+        if not (0.01 <= rho / ell <= 1.0):
+            notes.append(f"radius/l = {rho / ell:.3f} outside trained range 0.01-1.0")
+        if feats is None:
+            notes.append(f"mesh too coarse at corner (need h <= {MAX_H_OVER_ELL:.2f}*l)")
+        elif model is not None:
+            row["predicted_real_stress"] = predict(model, feats, rho)
+        if notes:
+            row["note"] = "; ".join(notes)
         rows.append(row)
     cols = ["vertex", "label", "x", "y", "angle_deg", "fe_stress_coarse", "fe_stress_fine", "refine_ratio",
             "singular", "ell", "type", "note"]
