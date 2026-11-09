@@ -73,6 +73,9 @@ def ansys_sampler(csv_path, poly):
     xy = df[["X", "Y"]].to_numpy(float)
     tri = Delaunay(xy).simplices
     inside = Path(np.vstack(poly)).contains_points(xy[tri].mean(1))   # drop triangles across notches
+    u, v = xy[tri[:, 1]] - xy[tri[:, 0]], xy[tri[:, 2]] - xy[tri[:, 0]]
+    area = 0.5 * np.abs(u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0])
+    inside &= area > 1e-8 * np.median(area)                             # and slivers on straight edges
     st = {"sx": df["SX"].to_numpy(), "sy": df["SY"].to_numpy(), "txy": df["SXY"].to_numpy(),
           "vm": df["SEQV"].to_numpy(), "tri": tri[inside]}
     return FieldSampler(xy, st), xy, st["vm"]

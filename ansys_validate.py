@@ -16,7 +16,9 @@ Usage (in the EigenStress folder):
   .venv\\Scripts\\python.exe ansys_validate.py                           (all parts)
   python ansys_validate.py --solver python                               (same pipeline, built-in solver)
 
-All parts: 2D plane stress, steel E = 210 GPa, nu = 0.3, thickness 1 mm, PLANE183 (quadratic triangles).
+All parts: 2D plane stress, steel E = 210 GPa, nu = 0.3, thickness 1 mm, PLANE183 (6-node triangles).
+Fillet runs grade the mesh from r/div at the fillet to the global size; their nodal CSVs are saved too
+(<part>_fillet_r<r>_div8/16.csv). Check: fillet_mesh_change_% should be within about +-2 % on every row.
 Loads are tractions in MPa on an edge (= N per mm of edge per mm of thickness).
 """
 import argparse
@@ -113,15 +115,15 @@ class MapdlSolver:
 
     def _vget(self, item, comp, n):
         m = self.mapdl
-        m.run("*DEL,_V_,,NOPR")
-        m.run(f"*DIM,_V_,ARRAY,{n}")
-        m.run(f"*VGET,_V_(1),NODE,1,{item}" + (f",{comp}" if comp else ""))
-        return np.asarray(m.parameters["_V_"], float).ravel()
+        arr = m.get_array(entity="NODE", entnum=1, item1=item, it1num=comp if comp else "")
+        arr = np.atleast_1d(np.asarray(arr, dtype=float)).ravel()
+        if len(arr) < n:                      # pad if MAPDL returned fewer entries than the max node number
+            arr = np.concatenate([arr, np.zeros(n - len(arr))])
+        return arr[:n]
 
     def _selected_nodes(self):
         m = self.mapdl
-        m.run("*GET,_NMAX_,NODE,0,NUM,MAXD")
-        n = int(m.parameters["_NMAX_"])
+        n = int(m.get_value("NODE", 0, "NUM", "MAXD"))
         sel = self._vget("NSEL", "", n) > 0
         ids = np.arange(1, n + 1)[sel]
         x = self._vget("LOC", "X", n)[sel]
@@ -135,7 +137,7 @@ class MapdlSolver:
         m.clear()
         m.prep7()
         m.et(1, "PLANE183")
-        m.keyopt(1, 1, 1)                         # 6-node triangles
+        m.keyopt(1, 1, 1)                         # 6-node triangles (not 8-node quads)
         m.keyopt(1, 3, 3)                         # plane stress with thickness
         m.r(1, THK)
         m.mp("EX", 1, E)
@@ -149,16 +151,22 @@ class MapdlSolver:
             for v in sharp_corners(part):         # vertex v sits between line v (or n) and line v+1
                 la, lb = (v if v > 0 else n), v + 1
                 m.lfillt(la, lb, fillet_r)
-                fillet_lines.append(int(m.get("_LMX_", "LINE", 0, "NUM", "MAX")))
+                fillet_lines.append(int(m.get_value("LINE", 0, "NUM", "MAX")))
+        hg = global_size(part)
         m.al("ALL")
-        m.esize(global_size(part))
+        m.esize(hg if fillet_r is not None else global_size(part))
         if fillet_r is None:
             for v in refine_vertices(part):
                 m.kesize(v + 1, h_corner)
         else:
+            hf = fillet_r / fillet_div
+            m.kesize("ALL", hg)                   # all keypoints at the global size ...
             for ln in fillet_lines:
-                m.lesize(ln, fillet_r / fillet_div)
-        m.mshape(1, "2D")                          # 1 = triangles
+                m.lesize(ln, hf)                  # ... the fillet arc at r/div ...
+                for end in (1, 2):                # ... and its two tangent points too, so the straight lines
+                    kp = int(m.get_value("LINE", ln, "KP", end))   # next to it grade smoothly from r/div up
+                    m.kesize(kp, hf)              # to the global size (no distorted elements at the peak)
+        m.mshape(1, "2D")                         # 1 = triangles
         m.mshkey(0)
         m.amesh("ALL")
 
@@ -254,6 +262,8 @@ def run(parts, solver, out_dir):
         for r in RADII:
             d8 = solver.solve(part, fillet_r=r, fillet_div=8)
             d16 = solver.solve(part, fillet_r=r, fillet_div=16)
+            d8.to_csv(os.path.join(out_dir, f"{key}_fillet_r{r:g}_div8.csv"), index=False)
+            d16.to_csv(os.path.join(out_dir, f"{key}_fillet_r{r:g}_div16.csv"), index=False)
             for v in cs:
                 p8, p16 = fillet_peak(d8, part, v, r), fillet_peak(d16, part, v, r)
                 truth[(v, r)] = (p16, 100 * (p16 - p8) / p8)

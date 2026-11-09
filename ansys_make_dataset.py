@@ -76,6 +76,9 @@ def node_cloud_mesh(spec, x, y):
             keep |= np.linalg.norm(cen - spec.poly[i], axis=1) < 3 * r
     for h in spec.poly_holes:
         keep &= ~Path(np.vstack(h)).contains_points(cen)
+    u, v = xy[tri[:, 1]] - xy[tri[:, 0]], xy[tri[:, 2]] - xy[tri[:, 0]]
+    area = 0.5 * np.abs(u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0])
+    keep &= area > 1e-8 * np.median(area)          # drop slivers from collinear boundary nodes
     spec.p = xy.T
     spec.t = tri[keep].T
 
@@ -94,16 +97,16 @@ class MapdlBackend:
 
     # --- helpers
     def _vget(self, item, comp, n):
-        m = self.m
-        m.run("*DEL,_V_,,NOPR")
-        m.run(f"*DIM,_V_,ARRAY,{n}")
-        m.run(f"*VGET,_V_(1),NODE,1,{item}" + (f",{comp}" if comp else ""))
-        return np.asarray(m.parameters["_V_"], float).ravel()
+        # same calls as the ansys_validate.py version that ran on ANSYS 2025 R1
+        arr = self.m.get_array(entity="NODE", entnum=1, item1=item, it1num=comp if comp else "")
+        arr = np.atleast_1d(np.asarray(arr, dtype=float)).ravel()
+        if len(arr) < n:
+            arr = np.concatenate([arr, np.zeros(n - len(arr))])
+        return arr[:n]
 
     def _selected_nodes(self):
         m = self.m
-        m.run("*GET,_NMAX_,NODE,0,NUM,MAXD")
-        n = int(m.parameters["_NMAX_"])
+        n = int(m.get_value("NODE", 0, "NUM", "MAXD"))
         sel = self._vget("NSEL", "", n) > 0
         ids = np.arange(1, n + 1)[sel]
         return n, sel, ids, self._vget("LOC", "X", n)[sel], self._vget("LOC", "Y", n)[sel]
@@ -112,8 +115,8 @@ class MapdlBackend:
         m = self.m
         m.ksel("S", "LOC", "X", P[0] - tol, P[0] + tol)
         m.ksel("R", "LOC", "Y", P[1] - tol, P[1] + tol)
-        cnt = int(m.get("_KC_", "KP", 0, "COUNT"))
-        k = int(m.get("_KN_", "KP", 0, "NUM", "MAX")) if cnt else 0
+        cnt = int(m.get_value("KP", 0, "COUNT"))
+        k = int(m.get_value("KP", 0, "NUM", "MAX")) if cnt else 0
         m.ksel("ALL")
         return k
 
@@ -123,7 +126,7 @@ class MapdlBackend:
         c = 0.5 * (np.asarray(p, float) + np.asarray(q, float))
         m.lsel("S", "LOC", "X", c[0] - tol, c[0] + tol)
         m.lsel("R", "LOC", "Y", c[1] - tol, c[1] + tol)
-        if int(m.get("_LC_", "LINE", 0, "COUNT")) == 0:
+        if int(m.get_value("LINE", 0, "COUNT")) == 0:
             m.allsel()
             raise RuntimeError(f"no line found at {c}")
         m.nsll("S", 1)
@@ -150,30 +153,32 @@ class MapdlBackend:
         for v, r in spec.fillets.items():    # vertex v sits between line v (or n) and line v+1
             la, lb = (v if v > 0 else n), v + 1
             m.lfillt(la, lb, float(r))
-            fillet_lines[v] = int(m.get("_LMX_", "LINE", 0, "NUM", "MAX"))
+            fillet_lines[v] = int(m.get_value("LINE", 0, "NUM", "MAX"))
         m.al("ALL")
-        a_out = int(m.get("_AMX_", "AREA", 0, "NUM", "MAX"))
+        a_out = int(m.get_value("AREA", 0, "NUM", "MAX"))
         for k, ring in enumerate(spec.poly_holes):
             base = 100000 * (k + 1)
             nh = len(ring)
             for i, (x, y) in enumerate(ring):
                 m.k(base + i + 1, float(x), float(y))
-            l0 = int(m.get("_LMX_", "LINE", 0, "NUM", "MAX")) + 1
+            l0 = int(m.get_value("LINE", 0, "NUM", "MAX")) + 1
             for i in range(nh):
                 m.l(base + i + 1, base + (i + 1) % nh + 1)
-            l1 = int(m.get("_LMX_", "LINE", 0, "NUM", "MAX"))
+            l1 = int(m.get_value("LINE", 0, "NUM", "MAX"))
             m.lsel("S", "LINE", "", l0, l1)
             m.al("ALL")
-            a_hole = int(m.get("_AMX_", "AREA", 0, "NUM", "MAX"))
+            a_hole = int(m.get_value("AREA", 0, "NUM", "MAX"))
             m.allsel()
             m.asba(a_out, a_hole)
-            a_out = int(m.get("_AMX_", "AREA", 0, "NUM", "MAX"))
+            a_out = int(m.get_value("AREA", 0, "NUM", "MAX"))
         m.allsel()
         m.esize(spec.h_global)
         m.kesize("ALL", spec.h_global)        # every keypoint gets the global size, so lines grade smoothly
         for i, h in spec.refine:
             if i in fillet_lines:
                 m.lesize(fillet_lines[i], float(h))
+                for end in (1, 2):               # tangent points at the fillet size -> smooth grading
+                    m.kesize(int(m.get_value("LINE", fillet_lines[i], "KP", end)), float(h))
             else:
                 kp = self._kp_at(poly[i], tol)
                 if kp:
