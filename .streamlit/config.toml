@@ -5,5 +5,8 @@ runOnSave = true          # the app reloads automatically when you save a .py fi
 gatherUsageStats = false
 
 [theme]
-base = "light"
-primaryColor = "#2a78d6"
+base = "dark"
+primaryColor = "#f2f2f2"            # accent is applied only to the Run button via CSS in app.py
+backgroundColor = "#0e0e0e"
+secondaryBackgroundColor = "#171717"
+textColor = "#f2f2f2"
