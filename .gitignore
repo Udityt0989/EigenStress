@@ -1,0 +1,19 @@
+# local Python environment + caches (created by run_app.bat) - never commit
+.venv/
+pip-cache/
+__pycache__/
+*.pyc
+
+# scratch / backups / exports
+*.log
+*.zip
+dataset_v1_hoopref.csv
+demo_ansys_*.csv
+
+# streamlit secrets, OS junk
+.streamlit/secrets.toml
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

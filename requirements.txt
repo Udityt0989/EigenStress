@@ -1,0 +1,11 @@
+streamlit>=1.40
+plotly>=5.20
+ezdxf>=1.1
+gmsh>=4.11
+scikit-fem>=9
+scikit-learn>=1.4
+numpy
+scipy
+pandas
+matplotlib
+joblib
