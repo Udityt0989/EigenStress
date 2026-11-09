@@ -26,13 +26,16 @@ def predict_many(model, feats, rhos):
     return np.exp(model["est"].predict(X)) * abs(feats["s_ref"])
 
 
-def required_radius(model, feats, allow, r_now=None):
+def required_radius(model, feats, allow, r_now=None, kind=None):
     """Smallest radius r (within 0.01-1.0 l) with predicted peak <= allow for r and every larger radius scanned.
     Returns (r_required, status, peak_at_r_required). status: 'ok' | 'any' (even 0.01 l is enough) |
     'impossible' (still above allow at r = l: a fillet alone cannot fix it - add material or reduce load)."""
     ell = feats["ell"]
     rhos = np.exp(np.linspace(np.log(0.01 * ell), np.log(1.0 * ell), N_SCAN))
     pk = predict_many(model, feats, rhos)
+    if kind:                                   # conservative: the TOP of the 90 % interval must stay below allow
+        pk = np.array([interval(p, r / ell, kind)[1] if np.isfinite(interval(p, r / ell, kind)[1]) else p
+                       for p, r in zip(pk, rhos)])
     ok = pk <= allow
     if ok.all():
         return float(rhos[0]), "any", float(pk[0])
@@ -113,7 +116,7 @@ def _arc_points(prev, P, nxt, r, max_turn_deg=8.0):
     return [tuple(cen + r * np.array([np.cos(a1 + da * u), np.sin(a1 + da * u)])) for u in np.linspace(0, 1, k + 1)]
 
 
-def apply_fillets(ring, radii):
+def apply_fillets(ring, radii, max_turn_deg=8.0):
     """ring: list of points; radii: {vertex index: radius}. Returns the ring with those vertices replaced by arcs."""
     out = []
     n = len(ring)
@@ -121,7 +124,7 @@ def apply_fillets(ring, radii):
         r = radii.get(i)
         if r and np.isfinite(r) and r > 0:
             out += _arc_points(np.asarray(ring[i - 1], float), np.asarray(P, float),
-                               np.asarray(ring[(i + 1) % n], float), float(r))
+                               np.asarray(ring[(i + 1) % n], float), float(r), max_turn_deg)
         else:
             out.append(tuple(map(float, P)))
     return out
@@ -136,3 +139,25 @@ def max_fillet(ring, i):
     psi = np.radians(abs(360.0 - beta)) if beta > 180 else np.radians(beta)
     adj = min(np.linalg.norm(P - a), np.linalg.norm(c - P))
     return 0.45 * adj * np.tan(psi / 2)
+
+
+# ------------------------------------------------------------------ 4. calibrated 90 % interval
+_CONF = None
+
+
+def interval(pred, rho_over_ell, kind="outline", path="conformal.json"):
+    """90 % conformal prediction interval for an ML peak (see build_conformal.py). kind: 'outline' | 'cutout'.
+    Returns (low, high, half-width %), or (nan, nan, nan) if no calibration file."""
+    import json, os
+    global _CONF
+    if _CONF is None:
+        p = path if os.path.isabs(path) else os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        _CONF = json.load(open(p)) if os.path.exists(p) else {}
+    if not _CONF or not np.isfinite(pred):
+        return np.nan, np.nan, np.nan
+    b = _CONF["labels"][int(np.clip(np.searchsorted(_CONF["bands"], rho_over_ell, side="left") - 1, 0, 3))]
+    q = _CONF["table"].get(f"{kind}|{b}", {}).get("q")
+    if q is None:
+        return np.nan, np.nan, np.nan
+    q = max(q, _CONF.get("floor", 0.0))           # never narrower than real parts justify
+    return pred * np.exp(-q), pred * np.exp(q), 100 * (np.exp(q) - 1)

@@ -264,6 +264,32 @@ def _inward(ring, i, t, e):
     return nrm if nrm @ e > 0 else -nrm
 
 
+FINGERPRINT_TOL = 0.15   # 90 % of 5,845 training corners grow within 7 % (cutouts 15 %) of 2^(1 - lambda)
+
+
+def _fingerprint(row, c, f, idx, geo_only, key="h"):
+    """Singularity fingerprint: a genuine sharp-corner singularity grows by (h_c / h_f)^(1 - lambda) from the
+    coarse to the fine mesh. Compare the measured growth with that; a large departure means the mesh does not
+    resolve the corner yet, or a neighbouring feature dominates it."""
+    row["growth_theory"] = np.nan
+    row["fingerprint"] = "n/a"
+    if geo_only:
+        return
+    try:
+        hc, hf = c[key][idx], f[key][idx]
+    except (KeyError, TypeError, IndexError):
+        return
+    if not (hc and hf) or hc <= hf:
+        return
+    th = (hc / hf) ** (1.0 - row["williams_lambda"])
+    row["growth_theory"] = th
+    dev = row["refine_ratio"] / th - 1.0
+    row["fingerprint_dev"] = dev
+    if row["refine_ratio"] > 0:
+        row["lambda_measured"] = 1.0 - np.log(row["refine_ratio"]) / np.log(hc / hf)
+    row["fingerprint"] = "ok" if abs(dev) <= FINGERPRINT_TOL else ("check" if abs(dev) <= 2 * FINGERPRINT_TOL else "fail")
+
+
 def analyse(part, sols, model=None):
     poly = part["poly"]
     beta = interior_angles(poly)
@@ -297,6 +323,7 @@ def analyse(part, sols, model=None):
         elif beta[i] > CANDIDATE_ANGLE and i not in fixv:
             row["type"] = "sharp re-entrant corner"
             row["williams_lambda"] = williams_lambda(beta[i])
+            _fingerprint(row, c, f, i, geo_only)
             rho = rad_by.get(i, rad_default)
             row["corner_radius"] = rho
             h = f["h"][i] if isinstance(f["h"], dict) else f["h"][i]
@@ -342,6 +369,7 @@ def analyse(part, sols, model=None):
             continue
         row["type"] = "sharp re-entrant corner"
         row["williams_lambda"] = williams_lambda(b)
+        _fingerprint(row, c, f, (k, i), geo_only, key="hole_h")
         rho = rad_default
         row["corner_radius"] = rho
         hmap = f.get("hole_h", {}) or {}

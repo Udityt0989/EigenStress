@@ -635,6 +635,9 @@ with st.sidebar:
     se_in = st.number_input("Endurance limit Se (MPa), 0 = auto", value=0.0, min_value=0.0, format="%g",
                             help="Fatigue strength at 10⁶ cycles. 0 = 0.5 σu (polished steel). Lower it for rough "
                                  "surfaces, size or reliability (e.g. 0.35-0.4 σu for machined parts).")
+    conf_r = st.checkbox("Required radius with 90 % confidence", value=True,
+                         help="Size each fillet so that the TOP of its calibrated 90 % prediction interval stays "
+                              "below the allowable stress (safer). Off: size on the central prediction.")
     cycle = st.radio("Load cycle", ["R=-1", "R=0"], horizontal=True,
                      format_func={"R=-1": "Reversed (±F)", "R=0": "On/off (0→F)"}.get,
                      help="How the applied forces repeat in service: fully reversed (+F to −F) or zero to max.")
@@ -932,17 +935,27 @@ with tab_an:
             flags["actual_after_yield"] = [x[0] for x in nb]
             flags["plastic_strain_pct"] = [100 * x[2] for x in nb]
         # ---- design answers: required radius (sharp corners) + fatigue (every hot spot)
-        from design_tools import required_radius, fatigue, life_text
+        from design_tools import required_radius, fatigue, life_text, interval
         allow = sy / sf
-        req_r, req_s = [], []
+        req_r, req_s, lo_, hi_, wd_ = [], [], [], [], []
         for _, r_ in flags.iterrows():
             fe_ = r_.get("feats")
+            kind_ = "cutout" if str(r_.get("label", "")).startswith("C") else "outline"
+            pk_ = r_.get("predicted_real_stress", np.nan)
+            if r_.get("type") == "sharp re-entrant corner" and np.isfinite(pk_ if pk_ is not None else np.nan):
+                a_, b_, w_ = interval(pk_, r_.corner_radius / r_.ell, kind_)
+            else:
+                a_, b_, w_ = np.nan, np.nan, np.nan
+            lo_.append(a_)
+            hi_.append(b_)
+            wd_.append(w_)
             if r_.get("type") == "sharp re-entrant corner" and isinstance(fe_, dict):
-                rr_, st_, _ = required_radius(model, fe_, allow)
+                rr_, st_, _ = required_radius(model, fe_, allow, kind=kind_ if conf_r else None)
             else:
                 rr_, st_ = np.nan, ""
             req_r.append(rr_)
             req_s.append(st_)
+        flags["pred_low_90"], flags["pred_high_90"], flags["pred_band_pct"] = lo_, hi_, wd_
         flags["required_radius"] = req_r
         flags["required_status"] = req_s
         sharp = flags[(flags.type == "sharp re-entrant corner")]
@@ -1092,8 +1105,10 @@ with tab_an:
                                "all are in the table below.")
                 for _, r in order.head(MAXCARDS).iterrows():
                     pr_ = r.get("predicted_real_stress", np.nan)
+                    rng_ = (f'<br>90 % RANGE {r.pred_low_90:.0f}–{r.pred_high_90:.0f} MPa (±{r.pred_band_pct:.0f} %, calibrated)'
+                            if np.isfinite(r.get("pred_low_90", np.nan)) else '')
                     ml_line = (f'<div class="ml">ML PREDICTED REAL STRESS · r = {r.corner_radius:g} mm'
-                               f'<span class="big">{pr_:.0f} MPa</span></div>') if np.isfinite(pr_) else \
+                               f'<span class="big">{pr_:.0f} MPa</span>{rng_}</div>') if np.isfinite(pr_) else \
                         '<div class="ml">ML PREDICTED REAL STRESS<span class="big">—</span></div>'
                     yld = ""
                     if np.isfinite(pr_):
@@ -1109,7 +1124,8 @@ with tab_an:
                             yld = f'<div class="yl">Below yield ({sy:g} MPa): elastic, prediction is the actual stress</div>'
                     rq_, rs_ = r.get("required_radius", np.nan), r.get("required_status", "")
                     if rs_ == "ok":
-                        req = (f'<div class="yl">REQUIRED RADIUS for ≤ {allow:.0f} MPa (σy/{sf:g}) → '
+                        req = (f'<div class="yl">REQUIRED RADIUS for ≤ {allow:.0f} MPa (σy/{sf:g}'
+                           + (', 90 % confidence' if conf_r else '') + ') → '
                                f'<b>r ≥ {rq_:.2f} mm</b>' + (' · current radius is enough' if r.corner_radius >= rq_
                                                               else ' · <b>increase the radius</b>') + '</div>')
                     elif rs_ == "any":
@@ -1121,6 +1137,15 @@ with tab_an:
                                'the load here</div>')
                     else:
                         req = ""
+                    fp_ = r.get("fingerprint", "n/a")
+                    if fp_ in ("ok", "check", "fail") and np.isfinite(r.get("lambda_measured", np.nan)):
+                        fpl = (f'<div class="sg">SINGULARITY FINGERPRINT · measured exponent λ = {r.lambda_measured:.2f}, '
+                               f'Williams theory λ = {r.williams_lambda:.2f} (growth ×{r.refine_ratio:.2f} vs ×{r.growth_theory:.2f}) → '
+                               + ('<b>matches: a genuine corner singularity</b>' if fp_ == "ok" else
+                                  '<b>does not match theory: the mesh may not resolve this corner, or a nearby feature '
+                                  'dominates it; treat the prediction with care</b>') + '</div>')
+                    else:
+                        fpl = ""
                     st.markdown(
                         f'<div class="card"><div class="hd">{r.label} · sharp corner {r.angle_deg:.0f}°</div>'
                         + (f'<div class="sg">SINGULARITY (FE value at the point) · {r.fe_stress_fine:.0f} MPa in the '
@@ -1130,12 +1155,17 @@ with tab_an:
                            f'<div class="sg">SINGULARITY (FE value at the point) · {r.fe_stress_coarse:.0f} → '
                            f'{r.fe_stress_fine:.0f} MPa as the mesh is halved (×{r.refine_ratio:.2f}). '
                            f'Not a real stress: it keeps rising with every refinement.</div>') +
-                        f'{ml_line}{yld}{req}</div>', unsafe_allow_html=True)
+                        f'{fpl}{ml_line}{yld}{req}</div>', unsafe_allow_html=True)
                 sharp = order.drop(columns="_k")
                 t = pd.DataFrame({
                     "point": list(sharp.label),
                     "FE singular": sharp.fe_stress_fine.round(0),
                     "ML real (MPa)": sharp.get("predicted_real_stress", pd.Series(np.nan, index=sharp.index)).round(0),
+                    "90 % range": [f"{a:.0f}–{b:.0f}" if np.isfinite(a) else "—"
+                                   for a, b in zip(sharp.pred_low_90, sharp.pred_high_90)],
+                    "λ meas/theory": [f"{m:.2f}/{t:.2f}" if np.isfinite(m) else "—" for m, t in
+                                      zip(sharp.get("lambda_measured", pd.Series(np.nan, index=sharp.index)),
+                                          sharp.get("williams_lambda", pd.Series(np.nan, index=sharp.index)))],
                     "after yield": sharp.get("actual_after_yield", pd.Series(np.nan, index=sharp.index)).round(0),
                     "r (mm)": sharp.corner_radius,
                     f"r needed ≤{allow:.0f}": [f"{x:.2f}" if s_ == "ok" else ("any" if s_ == "any" else
