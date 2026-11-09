@@ -1,4 +1,15 @@
+libgl1
 libglu1-mesa
+libopengl0
+libglvnd0
+libglx0
+libx11-6
+libxext6
+libxrender1
 libxcursor1
-libxinerama1
+libxfixes3
 libxft2
+libxinerama1
+libfontconfig1
+libfreetype6
+libgomp1
