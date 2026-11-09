@@ -77,6 +77,16 @@ input, textarea, [data-baseweb="select"] > div, [data-baseweb="input"], [data-te
 hr { border-color: var(--border) !important; }
 input, [data-baseweb="select"] div, [data-testid="stDataFrame"] * { font-family: 'Courier New', Courier, monospace !important; }
 .stMarkdown p.eyebrow, .eyebrow { font-family: 'Courier New', Courier, monospace !important; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: #8c8c8c; }
+.card { border: 1px solid var(--border); padding: 14px 16px; margin: 10px 0 14px; }
+.card .hd { font-family: 'Bebas Neue', 'Oswald', sans-serif; font-size: 24px; letter-spacing: 0.02em; color: var(--fg); }
+.card .sg { font-family: 'Courier New', Courier, monospace; font-size: 12px; color: #8c8c8c; margin: 6px 0 10px;
+  padding-left: 10px; border-left: 2px solid #5a5a5a; }
+.card .ml { font-family: 'Courier New', Courier, monospace; font-size: 12px; color: var(--fg); letter-spacing: 0.05em;
+  padding-left: 10px; border-left: 2px solid var(--accent); }
+.card .ml .big { display: block; font-family: 'Bebas Neue', 'Oswald', sans-serif; font-size: 44px; line-height: 1;
+  letter-spacing: 0.01em; margin-top: 2px; }
+.card .yl { font-family: 'Courier New', Courier, monospace; font-size: 12px; color: var(--fg); margin-top: 10px;
+  padding-left: 10px; border-left: 2px solid var(--fg); }
 .note { font-family: 'Courier New', Courier, monospace; font-size: 13px; color: var(--fg); border: 1px solid var(--border); padding: 10px 14px; margin: 8px 0; }
 </style>
 """, unsafe_allow_html=True)
@@ -283,7 +293,7 @@ def support_problem(supports, hole_bc):
     return None
 
 
-def result_figure(part, sols, flags, regular, hole_summary=()):
+def result_figure(part, sols, flags, regular, hole_summary=(), mat=None):
     from matplotlib.colors import LinearSegmentedColormap
     f = sols["fine"]
     m, vm = f["m"], f["vm"]
@@ -306,14 +316,19 @@ def result_figure(part, sols, flags, regular, hole_summary=()):
         geo = r.type == "sharp re-entrant corner"
         ax.plot(r.x, r.y, "o", ms=14, mfc="none", mec=C_SING if geo else "#8c8c8c", mew=2)
         lab = r.label
-        if geo and np.isfinite(r.get("predicted_real_stress", np.nan)):
-            lab += f" → {r.predicted_real_stress:.0f} MPA"
+        if geo:
+            lab = f"{r.label} SINGULARITY · FE {r.fe_stress_fine:.0f} (NOT REAL)"
+            if np.isfinite(r.get("predicted_real_stress", np.nan)):
+                lab += f"\nML REAL STRESS → {r.predicted_real_stress:.0f} MPA"
+                if mat and mat.get("on") and r.predicted_real_stress > mat["sy"]:
+                    sg, _, ep = neuber(r.predicted_real_stress, mat["E"], mat["sy"], mat["n"])
+                    lab += f"\nAFTER YIELD → {sg:.0f} MPA · εp {100 * ep:.2f}%"
         ax.annotate(lab, (r.x, r.y), xytext=(12, -22) if geo else (10, 10), textcoords="offset points",
                     fontsize=9, color=FG, family=mono, bbox=box, zorder=6 if geo else 4)
     for h in hole_summary:
         ax.plot(h["x"], h["y"], "D", ms=7, mfc="none", mec=FG, mew=1.4)
-        ax.annotate(f"{h['hole']} PEAK {h['peak_stress']:.0f}", (h["x"], h["y"]), xytext=(10, -14),
-                    textcoords="offset points", fontsize=8, color=FG, family=mono, bbox=box)
+        ax.annotate(f"{h['hole']} PEAK {h['peak_stress']:.0f}", (h["x"], h["y"]), xytext=(-10, -16),
+                    textcoords="offset points", fontsize=8, color=FG, family=mono, bbox=box, ha="right")
     v, p = regular["fine"]
     ax.plot(*p, "s", ms=9, mfc="none", mec=FG, mew=1.6)
     ax.annotate(f"MAX ELSEWHERE {v:.0f} MPA", p, xytext=(12, 10), textcoords="offset points", fontsize=9,
@@ -327,6 +342,23 @@ def result_figure(part, sols, flags, regular, hole_summary=()):
         t.set_color("#8c8c8c")
     fig.tight_layout()
     return fig
+
+
+# ------------------------------------------------------------------ plasticity (Neuber)
+def neuber(sig_e, E, sy, n):
+    """
+    Local stress/strain after yielding at a notch, from the linear-elastic peak sig_e (Neuber's rule):
+        sigma * eps = sig_e^2 / E,  with a Ramberg-Osgood curve  eps = sigma/E + 0.002 (sigma/sy)^(1/n).
+    Returns (sigma_actual, total_strain, plastic_strain). Below yield the elastic answer is returned.
+    """
+    from scipy.optimize import brentq
+    if not np.isfinite(sig_e) or sig_e <= sy:
+        return sig_e, sig_e / E, 0.0
+    target = sig_e ** 2 / E
+    f = lambda sg: sg * (sg / E + 0.002 * (sg / sy) ** (1 / n)) - target
+    sg = brentq(f, 1e-6, sig_e)
+    ep = 0.002 * (sg / sy) ** (1 / n)
+    return sg, sg / E + ep, ep
 
 
 # ------------------------------------------------------------------ contour fields + probe
@@ -388,7 +420,7 @@ CMAPS = {"Mono": [[0, "#1c1c1c"], [0.5, "#5a5a5a"], [1, "#f2f2f2"]],
          "ANSYS-style": [[0, "#0000ff"], [0.25, "#00b4ff"], [0.5, "#00ff00"], [0.75, "#ffff00"], [1, "#ff0000"]]}
 
 
-def contour_figure(gx, gy, Z, lo, hi, levels, cmap, unit, probes, extremes, height=560):
+def contour_figure(gx, gy, Z, lo, hi, levels, cmap, unit, probes, extremes, height=560, marks=()):
     fig = go.Figure()
     fig.add_trace(go.Contour(
         x=gx, y=gy, z=Z, zmin=lo, zmax=hi, colorscale=CMAPS[cmap], connectgaps=False,
@@ -409,6 +441,12 @@ def contour_figure(gx, gy, Z, lo, hi, levels, cmap, unit, probes, extremes, heig
                                  textposition=("top " if kind == "MAX" else "bottom ") + side, textfont=dict(family=MONO, color=FG, size=11),
                                  marker=dict(symbol="triangle-up" if kind == "MAX" else "triangle-down", size=13,
                                              color=BG, line=dict(color=FG, width=2)),
+                                 hoverinfo="skip", showlegend=False))
+    for (x, y, txt, real) in marks:
+        fig.add_trace(go.Scatter(x=[x], y=[y], mode="markers+text", text=[txt], textposition="bottom right",
+                                 textfont=dict(family=MONO, color=FG, size=10),
+                                 marker=dict(symbol="circle-open", size=16, color=C_SING if real else "#8c8c8c",
+                                             line=dict(width=2.2)),
                                  hoverinfo="skip", showlegend=False))
     for i, pr in enumerate(probes):
         fig.add_trace(go.Scatter(x=[pr["x"]], y=[pr["y"]], mode="markers+text", text=[f"P{i + 1}"],
@@ -530,6 +568,14 @@ with st.sidebar:
     rho = st.number_input("Real corner radius at sharp corners (mm)", value=0.5, min_value=0.001,
                           help="Machined inside corners are never perfectly sharp - typically 0.2-1 mm. "
                                "The real stress depends on this radius.")
+    sy = st.number_input("Yield strength σy (MPa)", value=250.0, min_value=1.0, format="%g",
+                         help="Mild steel ~250, S355 ~355, 6061-T6 aluminium ~275.")
+    plast = st.checkbox("Correct for yielding (Neuber's rule)", value=True,
+                        help="If the predicted elastic peak is above yield, the real material yields locally. "
+                             "Neuber's rule + a Ramberg-Osgood curve estimate the actual stress and plastic strain.")
+    n_ro = st.number_input("Hardening exponent n (Ramberg-Osgood)", value=0.15, min_value=0.02, max_value=0.5,
+                          format="%g", help="~0.1-0.2 for steels and aluminium alloys. Only used above yield.") \
+        if plast else 0.15
 
 # ------------------------------------------------------------------ geometry
 try:
@@ -733,14 +779,23 @@ if ss.results:
     if hole_rows:
         flags = pd.concat([flags, pd.DataFrame(hole_rows)], ignore_index=True)
     regular = max_regular_stress(part, sols, flags)
+    mat = {"E": E, "sy": sy, "n": n_ro, "on": plast}
+    if "predicted_real_stress" in flags:
+        nb = [neuber(v, E, sy, n_ro) if (plast and np.isfinite(v)) else (v, np.nan, 0.0)
+              for v in flags["predicted_real_stress"]]
+        flags["actual_after_yield"] = [x[0] for x in nb]
+        flags["plastic_strain_pct"] = [100 * x[2] for x in nb]
     sharp = flags[(flags.type == "sharp re-entrant corner")]
     artef = flags[(flags.type == "support / load artefact")]
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Sharp corners found", len(sharp))
-    m2.metric("Support / load artefacts", len(artef))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Sharp corners", len(sharp), help="Geometric singularities: the FE value there is not real.")
+    m2.metric("BC artefacts", len(artef))
+    preds = sharp.get("predicted_real_stress", pd.Series(dtype=float)).dropna()
+    m3.metric("Highest ML real stress", f"{preds.max():.0f} MPa" if len(preds) else "—",
+              help="Largest predicted real (linear-elastic) peak stress over all sharp corners.")
     v_c, v_f = regular["coarse"][0], regular["fine"][0]
-    m3.metric("Max converged stress elsewhere", f"{v_f:.0f} MPa",
+    m4.metric("Max converged elsewhere", f"{v_f:.0f} MPa",
               help=f"Away from all singular points (holes, real fillets, straight edges). Coarse mesh gave "
                    f"{v_c:.0f} MPa ({100 * (v_f - v_c) / v_c:+.1f}%), so this value is mesh-converged.")
 
@@ -783,7 +838,15 @@ if ss.results:
             gx, gy, Z = contour_grid(mfine.p[0], mfine.p[1], mfine.t.T, vals)
             ss.setdefault("probes", [])
             probes = probe_values(mfine, fields, ss.probes)
-            cfig = contour_figure(gx, gy, Z, lo, hi, levels, cmap, unit, probes, extremes)
+            marks = []
+            for _, r in flags[flags.singular].iterrows():
+                if r.type == "sharp re-entrant corner":
+                    pr_ = r.get("predicted_real_stress", np.nan)
+                    marks.append((r.x, r.y, f"{r.label} singularity · ML real {pr_:.0f} MPa"
+                                  if np.isfinite(pr_) else f"{r.label} singularity", True))
+                else:
+                    marks.append((r.x, r.y, f"{r.label} artefact", False))
+            cfig = contour_figure(gx, gy, Z, lo, hi, levels, cmap, unit, probes, extremes, marks=marks)
             ckey = f"ct_{fkey}_{len(ss.probes)}_{ss.get('run_id', 0)}"
             cev = st.plotly_chart(cfig, width="stretch", on_select="rerun", selection_mode="points", key=ckey,
                                   config={"displaylogo": False, "scrollZoom": True})
@@ -817,7 +880,7 @@ if ss.results:
                     ss.probes = []
                     st.rerun()
         with tab_s:
-            st.pyplot(result_figure(part, sols, flags, regular, hole_summary), width="stretch")
+            st.pyplot(result_figure(part, sols, flags, regular, hole_summary, mat), width="stretch")
         with tab_m:
             mc1, mc2 = st.columns(2)
             which = mc1.radio("Mesh", ["fine", "coarse"], horizontal=True, key="mesh_which",
@@ -848,17 +911,41 @@ if ss.results:
     with right:
         st.markdown("### Sharp corners → real stress")
         if len(sharp):
+            for _, r in sharp.iterrows():
+                pr_ = r.get("predicted_real_stress", np.nan)
+                ml_line = (f'<div class="ml">ML PREDICTED REAL STRESS · r = {r.corner_radius:g} mm'
+                           f'<span class="big">{pr_:.0f} MPa</span></div>') if np.isfinite(pr_) else \
+                    '<div class="ml">ML PREDICTED REAL STRESS<span class="big">—</span></div>'
+                yld = ""
+                if np.isfinite(pr_):
+                    if pr_ > sy and plast:
+                        yld = (f'<div class="yl">ABOVE YIELD ({sy:g} MPa) → ACTUAL AFTER LOCAL YIELDING '
+                               f'<b>{r.actual_after_yield:.0f} MPa</b> · plastic strain '
+                               f'<b>{r.plastic_strain_pct:.2f}%</b> (Neuber)'
+                               + (' · <b>very large plastic strain: cracking likely, redesign this corner</b>'
+                                  if r.plastic_strain_pct > 5 else '') + '</div>')
+                    elif pr_ > sy:
+                        yld = f'<div class="yl">ABOVE YIELD ({sy:g} MPa): the part yields locally here</div>'
+                    else:
+                        yld = f'<div class="yl">Below yield ({sy:g} MPa): elastic, prediction is the actual stress</div>'
+                st.markdown(
+                    f'<div class="card"><div class="hd">{r.label} · sharp corner {r.angle_deg:.0f}°</div>'
+                    f'<div class="sg">SINGULARITY (FE value at the point) · {r.fe_stress_coarse:.0f} → '
+                    f'{r.fe_stress_fine:.0f} MPa as the mesh is halved (×{r.refine_ratio:.2f}). '
+                    f'Not a real stress: it keeps rising with every refinement.</div>'
+                    f'{ml_line}{yld}</div>', unsafe_allow_html=True)
             t = pd.DataFrame({
                 "point": list(sharp.label),
-                "real stress (MPa)": sharp.get("predicted_real_stress", pd.Series(np.nan, index=sharp.index)).round(0),
-                "radius": sharp.corner_radius,
-                "angle": sharp.angle_deg.round(0),
-                "FE coarse→fine": [f"{a:.0f} → {b:.0f}" for a, b in zip(sharp.fe_stress_coarse, sharp.fe_stress_fine)],
+                "FE singular": sharp.fe_stress_fine.round(0),
+                "ML real (MPa)": sharp.get("predicted_real_stress", pd.Series(np.nan, index=sharp.index)).round(0),
+                "after yield": sharp.get("actual_after_yield", pd.Series(np.nan, index=sharp.index)).round(0),
+                "r (mm)": sharp.corner_radius,
             })
             st.dataframe(t, hide_index=True, width="stretch")
-            st.caption("FE coarse/fine = what the FE contour shows at the corner. It rises every time the mesh "
-                       "is refined, so it is not a real stress. 'Real stress' is the model's prediction for the "
-                       "corner radius set in the sidebar (change it and the table updates without re-solving).")
+            st.caption("FE singular = what an FE contour shows at the corner (mesh-dependent, not real). ML real = "
+                       "the model's linear-elastic peak for the corner radius in the sidebar. After yield = Neuber "
+                       "estimate when the elastic peak exceeds σy. Change radius / σy and everything updates "
+                       "without re-solving.")
             for _, r in sharp.iterrows():
                 if isinstance(r.get("note"), str) and r.note:
                     st.markdown(f'<div class="note">NOTE → {r.label}: {r.note}</div>', unsafe_allow_html=True)
@@ -883,6 +970,13 @@ if ss.results:
                 "sing.": hs.singular_points}), hide_index=True, width="stretch")
             st.caption("Highest stress on each hole edge away from flagged points. A small change vs the coarse "
                        "mesh means it is converged and real (this is the hole's stress concentration).")
+            over = [h["hole"] for h in hole_summary if h["peak_stress"] > sy]
+            if over:
+                st.markdown(f'<div class="note">NOTE → {", ".join(over)}: hole peak above yield ({sy:g} MPa); '
+                            'the hole edge yields locally.</div>', unsafe_allow_html=True)
+        if v_f > sy:
+            st.markdown(f'<div class="note">NOTE → max converged stress elsewhere ({v_f:.0f} MPa) is above yield '
+                        f'({sy:g} MPa): the part yields there too.</div>', unsafe_allow_html=True)
 
     rep = report_text(name, {"t": thickness, "E": E, "nu": nu}, sorted(ss.supports), loads, edges, flags, regular,
                       hole_bc, hole_summary, ss.forces)

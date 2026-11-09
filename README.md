@@ -1,4 +1,4 @@
-# EigenStress: FEM Singularity Finder and Real-Stress Predictor
+# FEM Stress-Singularity Finder and Real-Stress Predictor
 
 **What it does:** you give it a 2D part (outline, supports, loads). It solves the part at two mesh sizes, flags every point where the FE stress keeps rising as the mesh is refined (a singularity), and labels each one as either a sharp re-entrant corner (geometry) or an artefact of an idealised support or load. For each sharp corner it predicts the finite peak stress the real part sees for a given corner radius.
 
@@ -6,13 +6,13 @@
 **Windows:** put the folder where you want it (e.g. `D:\MOS\app files`) and double-click `run_app.bat`. The first run creates a private Python environment (`.venv`) and download cache (`pip-cache`) inside that folder, so nothing is installed on C:. Delete the folder to remove everything. **Mac/Linux:** `./run_app.sh`. The app opens in your browser at http://localhost:8501.
 
 1. **Part:** upload a DXF (in mm, or set the unit factor) or pick a sample. Lines, polylines, arcs (drawn fillets), circles (holes) and splines are read; the largest closed loop is the part outline.
-2. **Material and section:** thickness, E, ν, and the real corner radius at sharp corners (default 0.5 mm).
+2. **Material and section:** thickness, E, ν, the real corner radius at sharp corners (default 0.5 mm), yield strength σy and an optional yielding correction (Neuber's rule with a Ramberg-Osgood curve, hardening exponent n).
 3. **Supports and forces:** click edges (E0, E1, …) and holes (H0, H1, …) on the drawing to build a selection (click again to remove), then apply to the whole selection at once:
    - **Fix selected:** edges become clamped supports; holes become fixed (bolted / press-fit).
    - **Pin support** (holes): a frictionless pin with 180° contact on the side you choose (90 = the part hangs on the pin).
    - **Add force:** Fx/Fy in N, either a total *split* across the selection (edges by length → uniform pressure; holes equally → bolt group) or the *same force on each* item. On holes, a force is a bolt **bearing load** (cosine pressure on the loaded half). Add several forces to the same holes to load a bolt in several directions; the bolt carries their resultant.
    - The app blocks a run if the supports can't hold the part (e.g. a single pin with nothing else).
-4. **Run:** three result tabs: **Stress map** (summary), **Contours + probe** (von Mises, σx, σy, τxy, σ1, σ2, max shear, εx, εy, γxy, ε1; auto or manual range, number of bands, mono or ANSYS-style colours; hover for live values, click to pin probes P1, P2… with all values listed; ▲ max / ▼ min markers that skip singular spikes by default) and **Mesh** (coarse / fine mesh, zoom to any flagged point or hole, mesh statistics). Plus: stress map, sharp corners with their predicted real stress, support/load artefacts (including the edges of pin contact patches on holes), the converged peak stress on every hole, the highest converged stress elsewhere, and a downloadable report (Markdown) and results table (CSV). Changing the corner radius afterwards updates the predictions without re-solving.
+4. **Run:** every sharp corner gets a card showing, side by side, the **singularity** (the FE value at the point, coarse → fine, flagged as not real), the **ML predicted real stress** for the chosen radius, and, if that is above yield, the **actual stress after local yielding** and the plastic strain (Neuber). Three result tabs: **Stress map** (summary), **Contours + probe** (von Mises, σx, σy, τxy, σ1, σ2, max shear, εx, εy, γxy, ε1; auto or manual range, number of bands, mono or ANSYS-style colours; hover for live values, click to pin probes P1, P2… with all values listed; ▲ max / ▼ min markers that skip singular spikes by default) and **Mesh** (coarse / fine mesh, zoom to any flagged point or hole, mesh statistics). Plus: stress map, sharp corners with their predicted real stress, support/load artefacts (including the edges of pin contact patches on holes), the converged peak stress on every hole, the highest converged stress elsewhere, and a downloadable report (Markdown) and results table (CSV). Changing the corner radius afterwards updates the predictions without re-solving.
 
 To share it online for free: push this folder to GitHub, then deploy `app.py` on Streamlit Community Cloud (`packages.txt` installs the system libraries gmsh needs).
 
@@ -54,6 +54,7 @@ python validate_reference.py  # -> fig5..fig7, validation_reference.csv (Kirsch,
 | `sing_tool.py` | Command-line tool (built-in solver or ANSYS CSVs) |
 | `test_parts.py` | 3 unseen parts + filleted ground truth |
 | `make_figures.py` | Report figures |
+| `ansys_validate.py` | Automatic EigenStress-vs-ANSYS validation via PyMAPDL (sharp runs at 2/1/0.5 mm, filleted ground truth, comparison table). `--solver python` runs the same pipeline with the built-in solver |
 | `generate_lbracket_data.py` | PyMAPDL script, starting point for running the data generation in ANSYS |
 
 ## Method in one paragraph
@@ -82,12 +83,13 @@ None of these were used for training.
 | C. Stepped flat bar, shoulder fillets (fig7) | Peterson's Kt (Pilkey curve fits), 3 D/d ratios × 4 radii | **EigenStress from the sharp model: 4.9 % mean error**; FE with the fillet modelled: 3.3 %; naive sharp-node reading: 82.6 % |
 | D. Bolt / pin / bearing load cases (`validation_hole_loads.csv`) | Filleted FE ground truth | 1.6 % mean, 8 % max over 15 cases |
 | E. Unseen part shapes (`unseen_parts_results.csv`) | Filleted FE ground truth | 1.0–5.2 % (mean 2.3 %) |
+| F. Sharp FE results read from files, 4 parts × 3 radii (`python_validation_results.csv`) | Filleted FE ground truth | 1.3 % mean, 4.8 % max (sharp 0.5 mm reading: 21 %). The same run with ANSYS: `ansys_validate.py` |
 
 **Model history (kept honest).** v1 (brackets + notches, r/l ≤ 0.3) scored 28.9 % against Peterson because stepped shoulders with fillets comparable to the step height were outside its training range. v2 added a stepped-bar family and radii up to l, which brought Peterson to 4.9 % without losing accuracy elsewhere. Note that stepped bars are therefore no longer an unseen *shape family*; Peterson remains an independent reference. The largest remaining errors (10–14 %) are for fillets of 0.8 × the step height, at the edge of geometric possibility.
 
 ## Limitations (state these honestly)
 - App supports: clamped edges, fixed / pinned / bolt-loaded circular holes, and edge or hole forces (single or grouped). Pin contact is a fixed 180° frictionless patch (no gap, no friction): its ends are flagged as artefacts; true contact needs a nonlinear contact analysis. No rollers, pressures or point loads yet.
-- 2D plane stress, linear elastic material only. Plasticity at the corner would lower real peaks above yield.
+- 2D plane stress. The ML prediction is linear-elastic; above yield the app applies Neuber's rule (a standard engineering estimate, typically conservative for plane stress), not a full elastic-plastic FE analysis. Plasticity at the corner would lower real peaks above yield.
 - Only sharp re-entrant corners are predicted. Support and point-load singularities are flagged but not predicted, because their "real" value depends on how the real support is built.
 - The corner radius ρ must be given (the default is 0.5 mm). Without a length scale, the finite stress is undefined. Alternatives are a material critical distance (theory of critical distances) or a strain-gauge length.
 - Validity range: corner angles 190–330°, ρ/l from 0.01 to 1.0 (best below 0.3), fine mesh h ≤ 0.12·l at the corner. About 2.5% of test cases have errors above 20%. These are mostly very low-stress corners where other features dominate the local field.

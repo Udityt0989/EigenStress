@@ -49,7 +49,19 @@ def signed_area(poly):
 
 
 # ---------------------------------------------------------------- meshing
+import threading
+
+# gmsh keeps global state and is not thread-safe. The web app serves every visitor from one process
+# (several threads), so two simultaneous meshing jobs can crash it (segmentation fault). Serialise them.
+_GMSH_LOCK = threading.Lock()
+
+
 def mesh_polygon(poly, fillets=None, refine=None, h_global=5.0, verbose=False, circles=None, poly_holes=None):
+    with _GMSH_LOCK:
+        return _mesh_polygon(poly, fillets, refine, h_global, verbose, circles, poly_holes)
+
+
+def _mesh_polygon(poly, fillets=None, refine=None, h_global=5.0, verbose=False, circles=None, poly_holes=None):
     """
     poly       : CCW list of vertices
     fillets    : {vertex_index: radius}
@@ -68,6 +80,8 @@ def mesh_polygon(poly, fillets=None, refine=None, h_global=5.0, verbose=False, c
 
     gmsh.initialize(interruptible=False)   # no signal handler: lets it run inside the web app
     gmsh.option.setNumber("General.Terminal", 1 if verbose else 0)
+    gmsh.option.setNumber("General.NumThreads", 1)        # no extra worker threads inside gmsh
+    gmsh.option.setNumber("Mesh.MaxNumThreads2D", 1)
     gmsh.model.add("part")
     geo = gmsh.model.geo
     curves, vertex_entity = [], {}       # vertex_entity[i] = ("point", tag) or ("curve", tag)

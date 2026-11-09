@@ -17,3 +17,6 @@ desktop.ini
 .DS_Store
 .vscode/
 .idea/
+
+# built-in-solver validation scratch output (regenerate with: python ansys_validate.py --solver python --out py_out)
+py_out/
