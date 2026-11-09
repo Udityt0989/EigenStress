@@ -48,8 +48,11 @@ def summary(name, e):
 
 def main():
     parts = []
+    import sys
+    extra = sys.argv[sys.argv.index("--extra") + 1:] if "--extra" in sys.argv else []   # e.g. ANSYS datasets
     for f in ("dataset.csv", "dataset_notch.csv", "dataset_bracket2.csv",
-              "dataset_stepped.csv", "dataset_bracket_bigr.csv", "dataset_notch_bigr.csv", "dataset_window.csv"):
+              "dataset_stepped.csv", "dataset_bracket_bigr.csv", "dataset_notch_bigr.csv", "dataset_window.csv",
+              *extra):
         try:
             d = pd.read_csv(f)
         except FileNotFoundError:

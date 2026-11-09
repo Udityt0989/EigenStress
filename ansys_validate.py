@@ -135,6 +135,7 @@ class MapdlSolver:
         m.clear()
         m.prep7()
         m.et(1, "PLANE183")
+        m.keyopt(1, 1, 1)                         # 6-node triangles
         m.keyopt(1, 3, 3)                         # plane stress with thickness
         m.r(1, THK)
         m.mp("EX", 1, E)
@@ -157,7 +158,7 @@ class MapdlSolver:
         else:
             for ln in fillet_lines:
                 m.lesize(ln, fillet_r / fillet_div)
-        m.mshape(0, "2D")
+        m.mshape(1, "2D")                          # 1 = triangles
         m.mshkey(0)
         m.amesh("ALL")
 

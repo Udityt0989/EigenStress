@@ -1078,14 +1078,21 @@ if not ready:
     st.markdown('<p class="eyebrow">→ Set supports and loads first (section 03)</p>', unsafe_allow_html=True)
 else:
     o1, o2, o3, o4 = st.columns(4)
-    vf = o1.slider("Material to keep", 0.15, 0.8, 0.4, 0.05, key="to_vf",
-                   help="Fraction of the design area kept after optimisation.")
-    res_q = o2.select_slider("Resolution", ["coarse", "medium", "fine"], value="medium", key="to_res",
-                             help="Finer = more detailed shape, slower (about 10 s / 20 s / 40 s on a PC, longer online).")
-    start = o3.radio("Start from", ["solid", "current"], key="to_start", horizontal=True,
+    vf_pct = o1.number_input("Material to keep (%)", min_value=5.0, max_value=95.0, value=40.0, step=5.0,
+                             format="%g", key="to_vf",
+                             help="Percentage of the design area kept after optimisation (5-95).")
+    vf = vf_pct / 100.0
+    n_target = int(o2.number_input("Resolution (elements)", min_value=1000, max_value=200000, value=15000,
+                                   step=1000, key="to_res",
+                                   help="Number of triangles in the optimisation mesh. More = finer struts and "
+                                        "smoother shape, but slower: roughly 10 s per 15,000 elements on a PC "
+                                        "(longer online). 6,000 = quick look, 15,000 = default, 30,000+ = fine."))
+    n_iter = int(o3.number_input("Iterations", min_value=10, max_value=500, value=80, step=10, key="to_iter",
+                                 help="Optimisation steps. It stops earlier once the design stops changing."))
+    start = o4.radio("Start from", ["solid", "current"], key="to_start", horizontal=True,
                      format_func={"solid": "Solid outline", "current": "Current shape"}.get,
                      help="Solid outline ignores existing cutouts (bolt holes are always kept).")
-    fil_r = o4.number_input("Fillet radius on new shape (mm)", value=3.0, min_value=0.0, step=0.5, format="%g",
+    fil_r = o1.number_input("Fillet radius on new shape (mm)", value=3.0, min_value=0.0, step=0.5, format="%g",
                             key="to_fil",
                             help="Every corner of the optimised shape is rounded with this radius, as you would "
                                  "do in CAD before making it (no singularities left; the stress at each fillet is "
@@ -1098,7 +1105,6 @@ else:
             part0["poly_holes"] = []
         from shapely.geometry import Polygon as _Pg
         design_area = _Pg(geom["outline"]).area - sum(np.pi * r_ ** 2 for _, r_ in geom["circles"])
-        n_target = {"coarse": 6000, "medium": 15000, "fine": 30000}[res_q]
         hsel = float(np.sqrt(max(design_area, 1e-9) / (0.43 * n_target)))   # ~equilateral triangles
         bar = st.progress(0.0, text="Optimising…")
 
@@ -1108,7 +1114,7 @@ else:
             from sing_tool import min_wall
             if part0.get("poly_holes"):
                 hsel = min(hsel, max(min_wall(part0) / 2.5, hsel / 3))
-            tres = optimise(part0, volfrac=vf, h=hsel, callback=cb)
+            tres = optimise(part0, volfrac=vf, h=hsel, iters=n_iter, callback=cb)
             tgeo, hmap = extract_shape(tres, part0, round_r=float(fil_r))
             if not tgeo.get("connected", True):
                 st.warning("The optimised layout splits into separate pieces at this resolution / material "
@@ -1165,7 +1171,7 @@ else:
         dxf_bytes = open(tmpdxf, "rb").read(); os.remove(tmpdxf)
         b1, b2 = st.columns(2)
         b1.download_button("Download optimised shape (DXF)", dxf_bytes,
-                           file_name=f"{Path(name).stem}_optimised_{int(100 * T['vf'])}pct.dxf")
+                           file_name=f"{Path(name).stem}_optimised_{100 * T['vf']:g}pct.dxf")
         if b2.button("Analyse optimised shape with EigenStress →", width="stretch"):
             n_e_old = len(edges)
             seg_of = lambda i: [(tuple(p), tuple(q)) for p, q in edges[i]["segs"]]
@@ -1182,7 +1188,7 @@ else:
                                 "edge_segs": [sg for i in e_t for sg in seg_of(i)]})
             ss.pending_bc = {"hole_map": T["hole_map"], "hole_fix": dict(ss.hole_fix),
                              "fixed_segs": [sg for i in ss.supports for sg in seg_of(i)], "forces": fo_list}
-            ss.opt_geom = {"geom": tgeo, "name": f"{Path(name).stem} · optimised {int(100 * T['vf'])}%",
+            ss.opt_geom = {"geom": tgeo, "name": f"{Path(name).stem} · optimised {100 * T['vf']:g}%",
                            "key": f"opt_{gkey}_{T['vf']}_{len(tgeo['outline'])}_{len(tgeo['poly_holes'])}"}
             st.rerun()
 
