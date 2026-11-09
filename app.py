@@ -89,6 +89,10 @@ input, [data-baseweb="select"] div, [data-testid="stDataFrame"] * { font-family:
 .card .yl { font-family: 'Courier New', Courier, monospace; font-size: 12px; color: var(--fg); margin-top: 10px;
   padding-left: 10px; border-left: 2px solid var(--fg); }
 .note { font-family: 'Courier New', Courier, monospace; font-size: 13px; color: var(--fg); border: 1px solid var(--border); padding: 10px 14px; margin: 8px 0; }
+/* main Analyse / Optimise tabs: big section-style labels (only the top-level tab bar, not nested ones) */
+.st-key-main_tabs > div > div > [data-testid="stTab"], .st-key-main_tabs > div > div > [data-testid="stTab"] * {
+  font-family: 'Bebas Neue', 'Oswald', sans-serif !important; font-size: 30px !important; letter-spacing: 0.02em; }
+.st-key-main_tabs > div > div > [data-testid="stTab"] { padding: 6px 26px 10px 0 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -692,6 +696,7 @@ with col_ctrl:
             for j in sel_h:
                 ss.hole_fix[j] = {"type": "fixed"}
             ss.results = None
+            ss.pending_toggle = "clear"                # done with this selection: deselect
             st.rerun()
         if c2.button("Clear selected", width="stretch",
                      help="Remove supports, hole fixtures and forces from the selected items."):
@@ -702,6 +707,7 @@ with col_ctrl:
                 f["targets"] = [t for t in f["targets"] if t not in selection]
             ss.forces = [f for f in ss.forces if f["targets"]]
             ss.results = None
+            ss.pending_toggle = "clear"                # done with this selection: deselect
             st.rerun()
         if c3.button("Deselect all", width="stretch"):
             ss.pending_toggle = "clear"
@@ -729,6 +735,7 @@ with col_ctrl:
                     for j in sel_h:
                         ss.hole_fix.pop(j, None)
                     ss.results = None
+                    ss.pending_toggle = "clear"                # done with this selection: deselect
                     st.rerun()
 
         if sel_h:
@@ -742,6 +749,7 @@ with col_ctrl:
                     for j in sel_h:
                         ss.hole_fix[j] = {"type": "pin", "angle": float(ang)}
                     ss.results = None
+                    ss.pending_toggle = "clear"                # done with this selection: deselect
                     st.rerun()
 
     # ---- summary of everything applied
@@ -818,378 +826,390 @@ with col_plot:
     holes = len(geom["circles"]) + len(geom["poly_holes"])
     st.caption(f"{len(edges)} edges · {holes} hole(s) · solid white = support / fixture · dotted = force · yellow = selected")
 
-# ------------------------------------------------------------------ run
+# ------------------------------------------------------------------ 04 analyse / 05 optimise (tabs)
 st.divider()
-st.subheader("04 · Run")
-has_load = bool(loads) or any(b["type"] == "bearing" and any(b["F"]) for b in hole_bc.values())
-problem = support_problem(ss.supports, ss.hole_fix)
-ready = has_load and problem is None
-if problem:
-    st.markdown(f'<p class="eyebrow">→ {problem}</p>', unsafe_allow_html=True)
-if not has_load:
-    st.markdown('<p class="eyebrow">→ Add a force on an edge, or a bearing load on a hole</p>', unsafe_allow_html=True)
-run = st.button("Run analysis", type="primary", disabled=not ready)
+TAB_AN, TAB_OPT = "04 · Analyse", "05 · Optimise shape"
+if ss.get("goto_tab"):
+    ss["main_tabs"] = ss.pop("goto_tab")
+try:
+    tab_an, tab_opt = st.tabs([TAB_AN, TAB_OPT], key="main_tabs", on_change="rerun")
+except TypeError:                                            # older Streamlit: tabs without a key
+    tab_an, tab_opt = st.tabs([TAB_AN, TAB_OPT])
 
-if run:
-    part = build_part(geom, edges, ss.supports, loads, thickness, E, nu, rho, hole_bc)
-    with st.spinner("Meshing and solving at two mesh sizes…"):
-        try:
-            sols = solve_two_meshes(part)
-        except Exception as e:
-            st.error(f"Solve failed: {e}")
-            st.stop()
-    ss.results = {"part": part, "sols": sols,
-                  "used": [f"{f['name']} on {', '.join(lab(t) for t in f['targets'])}: "
-                           f"Fx {f['F'][0]:g} N, Fy {f['F'][1]:g} N ({f['mode']})" for f in ss.forces]}
-    ss.probes = []
-    ss.run_id = ss.get("run_id", 0) + 1
+with tab_an:
+    # ------------------------------------------------------------------ run
+    has_load = bool(loads) or any(b["type"] == "bearing" and any(b["F"]) for b in hole_bc.values())
+    problem = support_problem(ss.supports, ss.hole_fix)
+    ready = has_load and problem is None
+    if problem:
+        st.markdown(f'<p class="eyebrow">→ {problem}</p>', unsafe_allow_html=True)
+    if not has_load:
+        st.markdown('<p class="eyebrow">→ Add a force on an edge, or a bearing load on a hole</p>', unsafe_allow_html=True)
+    run = st.button("Run analysis", type="primary", disabled=not ready)
 
-if ss.results:
-    part, sols = ss.results["part"], ss.results["sols"]
-    part["corner_radius"] = rho
-    if ss.results.get("used"):
-        st.markdown('<div class="note">SOLVED WITH → ' + " · ".join(ss.results["used"]) + "</div>", unsafe_allow_html=True)
-    model = load_model()
-    flags = analyse(part, sols, model)
-    hole_rows, hole_summary = scan_holes(part, sols)
-    if hole_rows:
-        flags = pd.concat([flags, pd.DataFrame(hole_rows)], ignore_index=True)
-    regular = max_regular_stress(part, sols, flags)
-    mat = {"E": E, "sy": sy, "n": n_ro, "on": plast}
-    if "predicted_real_stress" in flags:
-        nb = [neuber(v, E, sy, n_ro) if (plast and np.isfinite(v)) else (v, np.nan, 0.0)
-              for v in flags["predicted_real_stress"]]
-        flags["actual_after_yield"] = [x[0] for x in nb]
-        flags["plastic_strain_pct"] = [100 * x[2] for x in nb]
-    sharp = flags[(flags.type == "sharp re-entrant corner")]
-    artef = flags[(flags.type == "support / load artefact")]
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Sharp corners", len(sharp), help="Geometric singularities: the FE value there is not real.")
-    m2.metric("BC artefacts", len(artef))
-    preds = sharp.get("predicted_real_stress", pd.Series(dtype=float)).dropna()
-    m3.metric("Highest ML real stress", f"{preds.max():.0f} MPa" if len(preds) else "—",
-              help="Largest predicted real (linear-elastic) peak stress over all sharp corners.")
-    v_c, v_f = regular["coarse"][0], regular["fine"][0]
-    m4.metric("Max converged elsewhere", f"{v_f:.0f} MPa",
-              help=f"Away from all singular points (holes, real fillets, straight edges). Coarse mesh gave "
-                   f"{v_c:.0f} MPa ({100 * (v_f - v_c) / v_c:+.1f}%), so this value is mesh-converged.")
-
-    left, right = st.columns([3, 2], gap="large")
-    with left:
-        tab_s, tab_c, tab_m = st.tabs(["Stress map", "Contours + probe", "Mesh"])
-        with tab_c:
-            mfine = sols["fine"]["m"]
-            fields = field_values(sols["fine"]["s"], part.get("E", 210000.0), part.get("nu", 0.3))
-            k1, k2 = st.columns([3, 2])
-            fkey = k1.selectbox("Field", list(FIELDS), format_func=lambda k: FIELDS[k][0], key="ct_field")
-            cmap = k2.selectbox("Colours", list(CMAPS), key="ct_cmap")
-            vals = fields[fkey]
-            unit = FIELDS[fkey][1]
-            near = singular_mask(mfine.p.T, flags)
-            k3, k4 = st.columns([3, 2])
-            rmode = k3.radio("Range", ["auto", "full", "manual"], horizontal=True, key="ct_range",
-                             format_func={"auto": "Auto (ignore singular spikes)", "full": "Auto (full)",
-                                          "manual": "Manual"}.get)
-            levels = k4.slider("Bands", 4, 30, 12, key="ct_levels")
-            v_ok = vals[~near] if (~near).any() else vals
-            if rmode == "auto":
-                lo, hi = float(v_ok.min()), float(v_ok.max())
-            else:
-                lo, hi = float(vals.min()), float(vals.max())
-            if rmode == "manual":
-                k5, k6 = st.columns(2)
-                lo = k5.number_input(f"Min ({unit})", value=float(f"{lo:.4g}"), format="%g", key=f"ct_lo_{fkey}")
-                hi = k6.number_input(f"Max ({unit})", value=float(f"{hi:.4g}"), format="%g", key=f"ct_hi_{fkey}")
-            if hi <= lo:
-                hi = lo + max(abs(lo), 1.0) * 1e-3
-            excl = st.checkbox("Max / min markers: exclude flagged singular points", value=True, key="ct_excl",
-                               help="At a sharp corner or clamp end the raw FE value is set by the mesh, "
-                                    "not the physics. Excluding them shows the real extremes.")
-            pool = ~near if (excl and (~near).any()) else np.ones(len(vals), bool)
-            imax = np.flatnonzero(pool)[np.argmax(vals[pool])]
-            imin = np.flatnonzero(pool)[np.argmin(vals[pool])]
-            extremes = {"MAX": (mfine.p[0, imax], mfine.p[1, imax], vals[imax]),
-                        "MIN": (mfine.p[0, imin], mfine.p[1, imin], vals[imin])}
-            gx, gy, Z = contour_grid(mfine.p[0], mfine.p[1], mfine.t.T, vals)
-            ss.setdefault("probes", [])
-            probes = probe_values(mfine, fields, ss.probes)
-            marks = []
-            for _, r in flags[flags.singular].iterrows():
-                if r.type == "sharp re-entrant corner":
-                    pr_ = r.get("predicted_real_stress", np.nan)
-                    marks.append((r.x, r.y, f"{r.label} singularity · ML real {pr_:.0f} MPa"
-                                  if np.isfinite(pr_) else f"{r.label} singularity", True))
-                else:
-                    marks.append((r.x, r.y, f"{r.label} artefact", False))
-            cfig = contour_figure(gx, gy, Z, lo, hi, levels, cmap, unit, probes, extremes, marks=marks)
-            ckey = f"ct_{fkey}_{len(ss.probes)}_{ss.get('run_id', 0)}"
-            cev = st.plotly_chart(cfig, width="stretch", on_select="rerun", selection_mode="points", key=ckey,
-                                  config={"displaylogo": False, "scrollZoom": True})
+    if run:
+        part = build_part(geom, edges, ss.supports, loads, thickness, E, nu, rho, hole_bc)
+        with st.spinner("Meshing and solving at two mesh sizes…"):
             try:
-                cpts = cev.selection.points if cev else []
-            except AttributeError:
-                cpts = (cev or {}).get("selection", {}).get("points", [])
-            if cpts:
-                px_, py_ = float(cpts[0]["x"]), float(cpts[0]["y"])
-                if ss.get("last_probe") != (px_, py_, ckey):
-                    ss.last_probe = (px_, py_, ckey)
-                    ss.probes.append((px_, py_))
-                    st.rerun()
-            st.caption("Hover for a live reading · click to pin a probe (P1, P2, …) · scroll to zoom, drag to pan. "
-                       f"▲ MAX {vals[imax]:.4g} {unit} at ({mfine.p[0, imax]:.1f}, {mfine.p[1, imax]:.1f}) · "
-                       f"▼ MIN {vals[imin]:.4g} {unit} at ({mfine.p[0, imin]:.1f}, {mfine.p[1, imin]:.1f})")
-            if probes:
-                pt = pd.DataFrame(probes)
-                show = pd.DataFrame({"probe": [f"P{i + 1}" for i in range(len(pt))],
-                                     "x, y (mm)": [f"{a:.2f}, {b:.2f}" for a, b in zip(pt.x, pt.y)],
-                                     "von Mises": pt.vm.round(1), "σ1": pt.s1.round(1), "σ2": pt.s2.round(1),
-                                     "τmax": pt.tmax.round(1), "ε1 (µε)": pt.e1.round(0)})
-                st.dataframe(show, hide_index=True, width="stretch")
-                warn = [f"P{i + 1}" for i, (x, y) in enumerate(ss.probes)
-                        if singular_mask(np.array([[x, y]]), flags, 0.15)[0]]
-                if warn:
-                    st.markdown(f'<div class="note">NOTE → {", ".join(warn)}: next to a flagged singular point, '
-                                'so the FE value there depends on the mesh. Use the predicted real stress instead.'
-                                '</div>', unsafe_allow_html=True)
-                if st.button("Clear probes", key="clear_probes"):
-                    ss.probes = []
-                    st.rerun()
-        with tab_s:
-            st.pyplot(result_figure(part, sols, flags, regular, hole_summary, mat), width="stretch")
-        with tab_m:
-            mc1, mc2 = st.columns(2)
-            which = mc1.radio("Mesh", ["fine", "coarse"], horizontal=True, key="mesh_which",
-                              format_func={"fine": "Fine (results)", "coarse": "Coarse (check)"}.get)
-            targets = {"Whole part": None}
-            for _, r in flags[flags.singular].iterrows():
-                targets[f"{r.label} · {r.type.split(' (')[0]}"] = (r.x, r.y, max(0.35 * r.ell, 1e-3))
-            for h in hole_summary:
-                c, rr = part["circles"][int(h["hole"][1:])]
-                targets[f"{h['hole']} · hole"] = (c[0], c[1], 2.2 * rr)
-            zoom = mc2.selectbox("Zoom to", list(targets), key="mesh_zoom")
-            m_ = sols[which]["m"]
-            tg = targets[zoom]
-            st.pyplot(mesh_figure(m_, flags, hole_summary,
-                                  None if tg is None else tg[:2], None if tg is None else tg[2],
-                                  title=f"{which.upper()} MESH · {zoom.upper()}"), width="stretch")
-            ms_c, ms_f = mesh_stats(sols["coarse"]["m"]), mesh_stats(sols["fine"]["m"])
-            st.dataframe(pd.DataFrame({
-                "": ["nodes", "elements", "degrees of freedom", "smallest element (mm)", "largest element (mm)"],
-                "coarse": [f"{ms_c['nodes']:,}", f"{ms_c['elements']:,}", f"{ms_c['dof']:,}",
-                           f"{ms_c['h_min']:.3f}", f"{ms_c['h_max']:.2f}"],
-                "fine": [f"{ms_f['nodes']:,}", f"{ms_f['elements']:,}", f"{ms_f['dof']:,}",
-                         f"{ms_f['h_min']:.3f}", f"{ms_f['h_max']:.2f}"]}),
-                hide_index=True, width="stretch")
-            st.caption("6-node quadratic triangles (like ANSYS PLANE183); drawn as their corner triangles. "
-                       "The fine mesh halves the element size at every corner, support end and hole; "
-                       "singular points are those whose stress keeps rising between the two.")
-    with right:
-        st.markdown("### Sharp corners → real stress")
-        if len(sharp):
-            order = sharp.assign(_k=sharp.get("predicted_real_stress", pd.Series(0.0, index=sharp.index)).fillna(0)) \
-                .sort_values("_k", ascending=False)
-            MAXCARDS = 5
-            if len(sharp) > MAXCARDS:
-                st.caption(f"{len(sharp)} sharp corners. Showing the {MAXCARDS} with the highest real stress; "
-                           "all are in the table below.")
-            for _, r in order.head(MAXCARDS).iterrows():
-                pr_ = r.get("predicted_real_stress", np.nan)
-                ml_line = (f'<div class="ml">ML PREDICTED REAL STRESS · r = {r.corner_radius:g} mm'
-                           f'<span class="big">{pr_:.0f} MPa</span></div>') if np.isfinite(pr_) else \
-                    '<div class="ml">ML PREDICTED REAL STRESS<span class="big">—</span></div>'
-                yld = ""
-                if np.isfinite(pr_):
-                    if pr_ > sy and plast:
-                        yld = (f'<div class="yl">ABOVE YIELD ({sy:g} MPa) → ACTUAL AFTER LOCAL YIELDING '
-                               f'<b>{r.actual_after_yield:.0f} MPa</b> · plastic strain '
-                               f'<b>{r.plastic_strain_pct:.2f}%</b> (Neuber)'
-                               + (' · <b>very large plastic strain: cracking likely, redesign this corner</b>'
-                                  if r.plastic_strain_pct > 5 else '') + '</div>')
-                    elif pr_ > sy:
-                        yld = f'<div class="yl">ABOVE YIELD ({sy:g} MPa): the part yields locally here</div>'
+                sols = solve_two_meshes(part)
+            except Exception as e:
+                st.error(f"Solve failed: {e}")
+                st.stop()
+        ss.results = {"part": part, "sols": sols,
+                      "used": [f"{f['name']} on {', '.join(lab(t) for t in f['targets'])}: "
+                               f"Fx {f['F'][0]:g} N, Fy {f['F'][1]:g} N ({f['mode']})" for f in ss.forces]}
+        ss.probes = []
+        ss.run_id = ss.get("run_id", 0) + 1
+
+    if ss.results:
+        part, sols = ss.results["part"], ss.results["sols"]
+        part["corner_radius"] = rho
+        if ss.results.get("used"):
+            st.markdown('<div class="note">SOLVED WITH → ' + " · ".join(ss.results["used"]) + "</div>", unsafe_allow_html=True)
+        model = load_model()
+        flags = analyse(part, sols, model)
+        hole_rows, hole_summary = scan_holes(part, sols)
+        if hole_rows:
+            flags = pd.concat([flags, pd.DataFrame(hole_rows)], ignore_index=True)
+        regular = max_regular_stress(part, sols, flags)
+        mat = {"E": E, "sy": sy, "n": n_ro, "on": plast}
+        if "predicted_real_stress" in flags:
+            nb = [neuber(v, E, sy, n_ro) if (plast and np.isfinite(v)) else (v, np.nan, 0.0)
+                  for v in flags["predicted_real_stress"]]
+            flags["actual_after_yield"] = [x[0] for x in nb]
+            flags["plastic_strain_pct"] = [100 * x[2] for x in nb]
+        sharp = flags[(flags.type == "sharp re-entrant corner")]
+        artef = flags[(flags.type == "support / load artefact")]
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Sharp corners", len(sharp), help="Geometric singularities: the FE value there is not real.")
+        m2.metric("BC artefacts", len(artef))
+        preds = sharp.get("predicted_real_stress", pd.Series(dtype=float)).dropna()
+        m3.metric("Highest ML real stress", f"{preds.max():.0f} MPa" if len(preds) else "—",
+                  help="Largest predicted real (linear-elastic) peak stress over all sharp corners.")
+        v_c, v_f = regular["coarse"][0], regular["fine"][0]
+        m4.metric("Max converged elsewhere", f"{v_f:.0f} MPa",
+                  help=f"Away from all singular points (holes, real fillets, straight edges). Coarse mesh gave "
+                       f"{v_c:.0f} MPa ({100 * (v_f - v_c) / v_c:+.1f}%), so this value is mesh-converged.")
+
+        left, right = st.columns([3, 2], gap="large")
+        with left:
+            tab_s, tab_c, tab_m = st.tabs(["Stress map", "Contours + probe", "Mesh"])
+            with tab_c:
+                mfine = sols["fine"]["m"]
+                fields = field_values(sols["fine"]["s"], part.get("E", 210000.0), part.get("nu", 0.3))
+                k1, k2 = st.columns([3, 2])
+                fkey = k1.selectbox("Field", list(FIELDS), format_func=lambda k: FIELDS[k][0], key="ct_field")
+                cmap = k2.selectbox("Colours", list(CMAPS), key="ct_cmap")
+                vals = fields[fkey]
+                unit = FIELDS[fkey][1]
+                near = singular_mask(mfine.p.T, flags)
+                k3, k4 = st.columns([3, 2])
+                rmode = k3.radio("Range", ["auto", "full", "manual"], horizontal=True, key="ct_range",
+                                 format_func={"auto": "Auto (ignore singular spikes)", "full": "Auto (full)",
+                                              "manual": "Manual"}.get)
+                levels = k4.slider("Bands", 4, 30, 12, key="ct_levels")
+                v_ok = vals[~near] if (~near).any() else vals
+                if rmode == "auto":
+                    lo, hi = float(v_ok.min()), float(v_ok.max())
+                else:
+                    lo, hi = float(vals.min()), float(vals.max())
+                if rmode == "manual":
+                    k5, k6 = st.columns(2)
+                    lo = k5.number_input(f"Min ({unit})", value=float(f"{lo:.4g}"), format="%g", key=f"ct_lo_{fkey}")
+                    hi = k6.number_input(f"Max ({unit})", value=float(f"{hi:.4g}"), format="%g", key=f"ct_hi_{fkey}")
+                if hi <= lo:
+                    hi = lo + max(abs(lo), 1.0) * 1e-3
+                excl = st.checkbox("Max / min markers: exclude flagged singular points", value=True, key="ct_excl",
+                                   help="At a sharp corner or clamp end the raw FE value is set by the mesh, "
+                                        "not the physics. Excluding them shows the real extremes.")
+                pool = ~near if (excl and (~near).any()) else np.ones(len(vals), bool)
+                imax = np.flatnonzero(pool)[np.argmax(vals[pool])]
+                imin = np.flatnonzero(pool)[np.argmin(vals[pool])]
+                extremes = {"MAX": (mfine.p[0, imax], mfine.p[1, imax], vals[imax]),
+                            "MIN": (mfine.p[0, imin], mfine.p[1, imin], vals[imin])}
+                gx, gy, Z = contour_grid(mfine.p[0], mfine.p[1], mfine.t.T, vals)
+                ss.setdefault("probes", [])
+                probes = probe_values(mfine, fields, ss.probes)
+                marks = []
+                for _, r in flags[flags.singular].iterrows():
+                    if r.type == "sharp re-entrant corner":
+                        pr_ = r.get("predicted_real_stress", np.nan)
+                        marks.append((r.x, r.y, f"{r.label} singularity · ML real {pr_:.0f} MPa"
+                                      if np.isfinite(pr_) else f"{r.label} singularity", True))
                     else:
-                        yld = f'<div class="yl">Below yield ({sy:g} MPa): elastic, prediction is the actual stress</div>'
-                st.markdown(
-                    f'<div class="card"><div class="hd">{r.label} · sharp corner {r.angle_deg:.0f}°</div>'
-                    f'<div class="sg">SINGULARITY (FE value at the point) · {r.fe_stress_coarse:.0f} → '
-                    f'{r.fe_stress_fine:.0f} MPa as the mesh is halved (×{r.refine_ratio:.2f}). '
-                    f'Not a real stress: it keeps rising with every refinement.</div>'
-                    f'{ml_line}{yld}</div>', unsafe_allow_html=True)
-            sharp = order.drop(columns="_k")
-            t = pd.DataFrame({
-                "point": list(sharp.label),
-                "FE singular": sharp.fe_stress_fine.round(0),
-                "ML real (MPa)": sharp.get("predicted_real_stress", pd.Series(np.nan, index=sharp.index)).round(0),
-                "after yield": sharp.get("actual_after_yield", pd.Series(np.nan, index=sharp.index)).round(0),
-                "r (mm)": sharp.corner_radius,
-            })
-            st.dataframe(t, hide_index=True, width="stretch")
-            st.caption("FE singular = what an FE contour shows at the corner (mesh-dependent, not real). ML real = "
-                       "the model's linear-elastic peak for the corner radius in the sidebar. After yield = Neuber "
-                       "estimate when the elastic peak exceeds σy. Change radius / σy and everything updates "
-                       "without re-solving.")
-            for _, r in sharp.iterrows():
-                if isinstance(r.get("note"), str) and r.note:
-                    st.markdown(f'<div class="note">NOTE → {r.label}: {r.note}</div>', unsafe_allow_html=True)
-        else:
-            st.write("No sharp re-entrant corners with singular stress.")
-        if len(artef):
-            st.markdown("### Support / load artefacts")
-            st.dataframe(pd.DataFrame({"point": list(artef.label),
-                                       "FE fine (MPa)": artef.fe_stress_fine.round(0),
-                                       "rise on refining": [f"×{x:.2f}" for x in artef.refine_ratio]}),
-                         hide_index=True, width="stretch")
-            st.caption("These come from idealised boundary conditions: a perfectly rigid clamp, a load that "
-                       "starts abruptly, or the sharp edge of an idealised pin contact (H…@ angle). They are not "
-                       "physical stresses. Read stresses away from them, or model the real support / contact.")
-        if hole_summary:
-            st.markdown("### Holes → peak stress")
-            hs = pd.DataFrame(hole_summary)
-            st.dataframe(pd.DataFrame({
-                "hole": hs.hole, "fixture": hs.fixture, "Ø": (2 * hs.radius_mm).round(1),
-                "peak (MPa)": hs.peak_stress.round(0), "at °": hs.at_angle_deg.round(0),
-                "Δ coarse": [f"{x:+.1f}%" for x in hs.change_pct],
-                "sing.": hs.singular_points}), hide_index=True, width="stretch")
-            st.caption("Highest stress on each hole edge away from flagged points. A small change vs the coarse "
-                       "mesh means it is converged and real (this is the hole's stress concentration).")
-            over = [h["hole"] for h in hole_summary if h["peak_stress"] > sy]
-            if over:
-                st.markdown(f'<div class="note">NOTE → {", ".join(over)}: hole peak above yield ({sy:g} MPa); '
-                            'the hole edge yields locally.</div>', unsafe_allow_html=True)
-        if v_f > sy:
-            st.markdown(f'<div class="note">NOTE → max converged stress elsewhere ({v_f:.0f} MPa) is above yield '
-                        f'({sy:g} MPa): the part yields there too.</div>', unsafe_allow_html=True)
+                        marks.append((r.x, r.y, f"{r.label} artefact", False))
+                cfig = contour_figure(gx, gy, Z, lo, hi, levels, cmap, unit, probes, extremes, marks=marks)
+                ckey = f"ct_{fkey}_{len(ss.probes)}_{ss.get('run_id', 0)}"
+                cev = st.plotly_chart(cfig, width="stretch", on_select="rerun", selection_mode="points", key=ckey,
+                                      config={"displaylogo": False, "scrollZoom": True})
+                try:
+                    cpts = cev.selection.points if cev else []
+                except AttributeError:
+                    cpts = (cev or {}).get("selection", {}).get("points", [])
+                if cpts:
+                    px_, py_ = float(cpts[0]["x"]), float(cpts[0]["y"])
+                    if ss.get("last_probe") != (px_, py_, ckey):
+                        ss.last_probe = (px_, py_, ckey)
+                        ss.probes.append((px_, py_))
+                        st.rerun()
+                st.caption("Hover for a live reading · click to pin a probe (P1, P2, …) · scroll to zoom, drag to pan. "
+                           f"▲ MAX {vals[imax]:.4g} {unit} at ({mfine.p[0, imax]:.1f}, {mfine.p[1, imax]:.1f}) · "
+                           f"▼ MIN {vals[imin]:.4g} {unit} at ({mfine.p[0, imin]:.1f}, {mfine.p[1, imin]:.1f})")
+                if probes:
+                    pt = pd.DataFrame(probes)
+                    show = pd.DataFrame({"probe": [f"P{i + 1}" for i in range(len(pt))],
+                                         "x, y (mm)": [f"{a:.2f}, {b:.2f}" for a, b in zip(pt.x, pt.y)],
+                                         "von Mises": pt.vm.round(1), "σ1": pt.s1.round(1), "σ2": pt.s2.round(1),
+                                         "τmax": pt.tmax.round(1), "ε1 (µε)": pt.e1.round(0)})
+                    st.dataframe(show, hide_index=True, width="stretch")
+                    warn = [f"P{i + 1}" for i, (x, y) in enumerate(ss.probes)
+                            if singular_mask(np.array([[x, y]]), flags, 0.15)[0]]
+                    if warn:
+                        st.markdown(f'<div class="note">NOTE → {", ".join(warn)}: next to a flagged singular point, '
+                                    'so the FE value there depends on the mesh. Use the predicted real stress instead.'
+                                    '</div>', unsafe_allow_html=True)
+                    if st.button("Clear probes", key="clear_probes"):
+                        ss.probes = []
+                        st.rerun()
+            with tab_s:
+                st.pyplot(result_figure(part, sols, flags, regular, hole_summary, mat), width="stretch")
+            with tab_m:
+                mc1, mc2 = st.columns(2)
+                which = mc1.radio("Mesh", ["fine", "coarse"], horizontal=True, key="mesh_which",
+                                  format_func={"fine": "Fine (results)", "coarse": "Coarse (check)"}.get)
+                targets = {"Whole part": None}
+                for _, r in flags[flags.singular].iterrows():
+                    targets[f"{r.label} · {r.type.split(' (')[0]}"] = (r.x, r.y, max(0.35 * r.ell, 1e-3))
+                for h in hole_summary:
+                    c, rr = part["circles"][int(h["hole"][1:])]
+                    targets[f"{h['hole']} · hole"] = (c[0], c[1], 2.2 * rr)
+                zoom = mc2.selectbox("Zoom to", list(targets), key="mesh_zoom")
+                m_ = sols[which]["m"]
+                tg = targets[zoom]
+                st.pyplot(mesh_figure(m_, flags, hole_summary,
+                                      None if tg is None else tg[:2], None if tg is None else tg[2],
+                                      title=f"{which.upper()} MESH · {zoom.upper()}"), width="stretch")
+                ms_c, ms_f = mesh_stats(sols["coarse"]["m"]), mesh_stats(sols["fine"]["m"])
+                st.dataframe(pd.DataFrame({
+                    "": ["nodes", "elements", "degrees of freedom", "smallest element (mm)", "largest element (mm)"],
+                    "coarse": [f"{ms_c['nodes']:,}", f"{ms_c['elements']:,}", f"{ms_c['dof']:,}",
+                               f"{ms_c['h_min']:.3f}", f"{ms_c['h_max']:.2f}"],
+                    "fine": [f"{ms_f['nodes']:,}", f"{ms_f['elements']:,}", f"{ms_f['dof']:,}",
+                             f"{ms_f['h_min']:.3f}", f"{ms_f['h_max']:.2f}"]}),
+                    hide_index=True, width="stretch")
+                st.caption("6-node quadratic triangles (like ANSYS PLANE183); drawn as their corner triangles. "
+                           "The fine mesh halves the element size at every corner, support end and hole; "
+                           "singular points are those whose stress keeps rising between the two.")
+        with right:
+            st.markdown("### Sharp corners → real stress")
+            if len(sharp):
+                order = sharp.assign(_k=sharp.get("predicted_real_stress", pd.Series(0.0, index=sharp.index)).fillna(0)) \
+                    .sort_values("_k", ascending=False)
+                MAXCARDS = 5
+                if len(sharp) > MAXCARDS:
+                    st.caption(f"{len(sharp)} sharp corners. Showing the {MAXCARDS} with the highest real stress; "
+                               "all are in the table below.")
+                for _, r in order.head(MAXCARDS).iterrows():
+                    pr_ = r.get("predicted_real_stress", np.nan)
+                    ml_line = (f'<div class="ml">ML PREDICTED REAL STRESS · r = {r.corner_radius:g} mm'
+                               f'<span class="big">{pr_:.0f} MPa</span></div>') if np.isfinite(pr_) else \
+                        '<div class="ml">ML PREDICTED REAL STRESS<span class="big">—</span></div>'
+                    yld = ""
+                    if np.isfinite(pr_):
+                        if pr_ > sy and plast:
+                            yld = (f'<div class="yl">ABOVE YIELD ({sy:g} MPa) → ACTUAL AFTER LOCAL YIELDING '
+                                   f'<b>{r.actual_after_yield:.0f} MPa</b> · plastic strain '
+                                   f'<b>{r.plastic_strain_pct:.2f}%</b> (Neuber)'
+                                   + (' · <b>very large plastic strain: cracking likely, redesign this corner</b>'
+                                      if r.plastic_strain_pct > 5 else '') + '</div>')
+                        elif pr_ > sy:
+                            yld = f'<div class="yl">ABOVE YIELD ({sy:g} MPa): the part yields locally here</div>'
+                        else:
+                            yld = f'<div class="yl">Below yield ({sy:g} MPa): elastic, prediction is the actual stress</div>'
+                    st.markdown(
+                        f'<div class="card"><div class="hd">{r.label} · sharp corner {r.angle_deg:.0f}°</div>'
+                        f'<div class="sg">SINGULARITY (FE value at the point) · {r.fe_stress_coarse:.0f} → '
+                        f'{r.fe_stress_fine:.0f} MPa as the mesh is halved (×{r.refine_ratio:.2f}). '
+                        f'Not a real stress: it keeps rising with every refinement.</div>'
+                        f'{ml_line}{yld}</div>', unsafe_allow_html=True)
+                sharp = order.drop(columns="_k")
+                t = pd.DataFrame({
+                    "point": list(sharp.label),
+                    "FE singular": sharp.fe_stress_fine.round(0),
+                    "ML real (MPa)": sharp.get("predicted_real_stress", pd.Series(np.nan, index=sharp.index)).round(0),
+                    "after yield": sharp.get("actual_after_yield", pd.Series(np.nan, index=sharp.index)).round(0),
+                    "r (mm)": sharp.corner_radius,
+                })
+                st.dataframe(t, hide_index=True, width="stretch")
+                st.caption("FE singular = what an FE contour shows at the corner (mesh-dependent, not real). ML real = "
+                           "the model's linear-elastic peak for the corner radius in the sidebar. After yield = Neuber "
+                           "estimate when the elastic peak exceeds σy. Change radius / σy and everything updates "
+                           "without re-solving.")
+                for _, r in sharp.iterrows():
+                    if isinstance(r.get("note"), str) and r.note:
+                        st.markdown(f'<div class="note">NOTE → {r.label}: {r.note}</div>', unsafe_allow_html=True)
+            else:
+                st.write("No sharp re-entrant corners with singular stress.")
+            if len(artef):
+                st.markdown("### Support / load artefacts")
+                st.dataframe(pd.DataFrame({"point": list(artef.label),
+                                           "FE fine (MPa)": artef.fe_stress_fine.round(0),
+                                           "rise on refining": [f"×{x:.2f}" for x in artef.refine_ratio]}),
+                             hide_index=True, width="stretch")
+                st.caption("These come from idealised boundary conditions: a perfectly rigid clamp, a load that "
+                           "starts abruptly, or the sharp edge of an idealised pin contact (H…@ angle). They are not "
+                           "physical stresses. Read stresses away from them, or model the real support / contact.")
+            if hole_summary:
+                st.markdown("### Holes → peak stress")
+                hs = pd.DataFrame(hole_summary)
+                st.dataframe(pd.DataFrame({
+                    "hole": hs.hole, "fixture": hs.fixture, "Ø": (2 * hs.radius_mm).round(1),
+                    "peak (MPa)": hs.peak_stress.round(0), "at °": hs.at_angle_deg.round(0),
+                    "Δ coarse": [f"{x:+.1f}%" for x in hs.change_pct],
+                    "sing.": hs.singular_points}), hide_index=True, width="stretch")
+                st.caption("Highest stress on each hole edge away from flagged points. A small change vs the coarse "
+                           "mesh means it is converged and real (this is the hole's stress concentration).")
+                over = [h["hole"] for h in hole_summary if h["peak_stress"] > sy]
+                if over:
+                    st.markdown(f'<div class="note">NOTE → {", ".join(over)}: hole peak above yield ({sy:g} MPa); '
+                                'the hole edge yields locally.</div>', unsafe_allow_html=True)
+            if v_f > sy:
+                st.markdown(f'<div class="note">NOTE → max converged stress elsewhere ({v_f:.0f} MPa) is above yield '
+                            f'({sy:g} MPa): the part yields there too.</div>', unsafe_allow_html=True)
 
-    rep = report_text(name, {"t": thickness, "E": E, "nu": nu}, sorted(ss.supports), loads, edges, flags, regular,
-                      hole_bc, hole_summary, ss.forces)
-    d1, d2 = st.columns(2)
-    d1.download_button("Download report (Markdown)", rep, file_name=f"{Path(name).stem}_singularity_report.md")
-    d2.download_button("Download results (CSV)", flags.to_csv(index=False),
-                       file_name=f"{Path(name).stem}_singular_points.csv")
+        rep = report_text(name, {"t": thickness, "E": E, "nu": nu}, sorted(ss.supports), loads, edges, flags, regular,
+                          hole_bc, hole_summary, ss.forces)
+        d1, d2 = st.columns(2)
+        d1.download_button("Download report (Markdown)", rep, file_name=f"{Path(name).stem}_singularity_report.md")
+        d2.download_button("Download results (CSV)", flags.to_csv(index=False),
+                           file_name=f"{Path(name).stem}_singular_points.csv")
 
-# ------------------------------------------------------------------ 05 · topology optimisation
-st.divider()
-st.subheader("05 · Optimise shape")
-st.markdown('<p class="eyebrow">Topology optimisation (SIMP, minimum compliance): keeps the stiffest '
-            'layout of material for a target volume, using the supports and loads above. Material around '
-            'loaded / fixed holes and edges is always kept.</p>', unsafe_allow_html=True)
-if not ready:
-    st.markdown('<p class="eyebrow">→ Set supports and loads first (section 03)</p>', unsafe_allow_html=True)
-else:
-    o1, o2, o3, o4 = st.columns(4)
-    vf_pct = o1.number_input("Material to keep (%)", min_value=5.0, max_value=95.0, value=40.0, step=5.0,
-                             format="%g", key="to_vf",
-                             help="Percentage of the design area kept after optimisation (5-95).")
-    vf = vf_pct / 100.0
-    n_target = int(o2.number_input("Resolution (elements)", min_value=1000, max_value=200000, value=15000,
-                                   step=1000, key="to_res",
-                                   help="Number of triangles in the optimisation mesh. More = finer struts and "
-                                        "smoother shape, but slower: roughly 10 s per 15,000 elements on a PC "
-                                        "(longer online). 6,000 = quick look, 15,000 = default, 30,000+ = fine."))
-    n_iter = int(o3.number_input("Iterations", min_value=10, max_value=500, value=80, step=10, key="to_iter",
-                                 help="Optimisation steps. It stops earlier once the design stops changing."))
-    start = o4.radio("Start from", ["solid", "current"], key="to_start", horizontal=True,
-                     format_func={"solid": "Solid outline", "current": "Current shape"}.get,
-                     help="Solid outline ignores existing cutouts (bolt holes are always kept).")
-    fil_r = o1.number_input("Fillet radius on new shape (mm)", value=3.0, min_value=0.0, step=0.5, format="%g",
-                            key="to_fil",
-                            help="Every corner of the optimised shape is rounded with this radius, as you would "
-                                 "do in CAD before making it (no singularities left; the stress at each fillet is "
-                                 "then a real, converged FE value). 0 keeps sharp corners so EigenStress predicts "
-                                 "their real stress for the corner radius set in the sidebar.")
-    if st.button("Optimise", key="to_run"):
-        part0 = build_part(geom, edges, ss.supports, loads, thickness, E, nu, rho, hole_bc)
-        if start == "solid":
-            part0 = dict(part0)
-            part0["poly_holes"] = []
-        from shapely.geometry import Polygon as _Pg
-        design_area = _Pg(geom["outline"]).area - sum(np.pi * r_ ** 2 for _, r_ in geom["circles"])
-        hsel = float(np.sqrt(max(design_area, 1e-9) / (0.43 * n_target)))   # ~equilateral triangles
-        bar = st.progress(0.0, text="Optimising…")
 
-        def cb(i, n, c, v):
-            bar.progress(i / n, text=f"Iteration {i}/{n} · compliance {c:.4g} · volume {v:.2f}")
-        try:
-            from sing_tool import min_wall
-            if part0.get("poly_holes"):
-                hsel = min(hsel, max(min_wall(part0) / 2.5, hsel / 3))
-            tres = optimise(part0, volfrac=vf, h=hsel, iters=n_iter, callback=cb)
-            tgeo, hmap = extract_shape(tres, part0, round_r=float(fil_r))
-            if not tgeo.get("connected", True):
-                st.warning("The optimised layout splits into separate pieces at this resolution / material "
-                           "fraction, so it cannot be analysed as one part. Try more material or a finer resolution.")
-            ss.topo = {"res": tres, "geo": tgeo, "hole_map": hmap, "part": part0, "vf": vf, "fil_r": float(fil_r)}
-        except Exception as ex:
-            st.error(f"Optimisation failed: {ex}")
-        bar.empty()
-    if ss.get("topo"):
-        T = ss.topo
-        tres, tgeo = T["res"], T["geo"]
-        hst = pd.DataFrame(tres["history"])
-        t1, t2, t3, t4 = st.columns(4)
-        t1.metric("Material kept", f"{100 * tgeo['volume_kept']:.0f}%")
-        t2.metric("Mass saved", f"{100 * (1 - tgeo['volume_kept']):.0f}%")
-        rel = tres["c_full"] / hst.compliance.iloc[-1]
-        t3.metric("Stiffness vs solid", f"{100 * rel:.0f}%",
-                  help="Compliance of the full solid part divided by the optimised compliance "
-                       "(100% = as stiff as the solid part).")
-        t4.metric("Iterations", len(hst))
-        cA, cB = st.columns(2)
-        mo = tres["mesh"]
-        figd, axd = plt.subplots(figsize=(7, 5), facecolor=BG)
-        axd.set_facecolor(BG)
-        axd.tripcolor(mo.p[0], mo.p[1], mo.t.T, facecolors=tres["density"], cmap="gray", vmin=0, vmax=1)
-        axd.set_aspect("equal"); axd.axis("off")
-        axd.set_title("DENSITY (WHITE = MATERIAL)", color="#8c8c8c", fontsize=9, family="monospace", loc="left")
-        cA.pyplot(figd, width="stretch")
-        figs, axs = plt.subplots(figsize=(7, 5), facecolor=BG)
-        axs.set_facecolor(BG)
-        o_ = np.array(tgeo["outline"] + [tgeo["outline"][0]])
-        axs.fill(o_[:, 0], o_[:, 1], color="#5a5a5a"); axs.plot(o_[:, 0], o_[:, 1], color=FG, lw=1)
-        for hh in tgeo["poly_holes"]:
-            hh = np.array(hh + [hh[0]]); axs.fill(hh[:, 0], hh[:, 1], color=BG); axs.plot(hh[:, 0], hh[:, 1], color=FG, lw=1)
-        for c_, r_ in tgeo["circles"]:
-            tt = np.linspace(0, 2 * np.pi, 60)
-            axs.fill(c_[0] + r_ * np.cos(tt), c_[1] + r_ * np.sin(tt), color=BG)
-            axs.plot(c_[0] + r_ * np.cos(tt), c_[1] + r_ * np.sin(tt), color=FG, lw=1)
-        axs.set_aspect("equal"); axs.axis("off")
-        axs.set_title(f"EXTRACTED SHAPE · {len(tgeo['poly_holes'])} CUTOUTS", color="#8c8c8c", fontsize=9,
-                      family="monospace", loc="left")
-        cB.pyplot(figs, width="stretch")
-        if ss.topo.get("fil_r", 0) > 0:
-            st.caption(f"The density field is smoothed into a clean outline and every corner is filleted with "
-                       f"r = {ss.topo['fil_r']:g} mm, so the new part has no stress singularities: EigenStress reports "
-                       "real, converged stresses at the fillets. Set the fillet radius to 0 to keep sharp corners "
-                       "and have EigenStress predict their real stress instead.")
-        else:
-            st.caption("Sharp corners kept where struts meet. Send it to EigenStress to see which are singular and "
-                       "what their real stress is for the corner radius in the sidebar.")
-        import tempfile, os
-        fd, tmpdxf = tempfile.mkstemp(suffix=".dxf"); os.close(fd)
-        write_dxf(tgeo, tmpdxf)
-        dxf_bytes = open(tmpdxf, "rb").read(); os.remove(tmpdxf)
-        b1, b2 = st.columns(2)
-        b1.download_button("Download optimised shape (DXF)", dxf_bytes,
-                           file_name=f"{Path(name).stem}_optimised_{100 * T['vf']:g}pct.dxf")
-        if b2.button("Analyse optimised shape with EigenStress →", width="stretch"):
-            n_e_old = len(edges)
-            seg_of = lambda i: [(tuple(p), tuple(q)) for p, q in edges[i]["segs"]]
-            fo_list = []
-            for fo in ss.forces:
-                e_t = [t for t in fo["targets"] if t < n_e_old]
-                h_t = [t - n_e_old for t in fo["targets"] if t >= n_e_old]
-                F_ = fo["F"]
-                mode = fo["mode"]
-                if mode == "each" and e_t:                 # keep the same total force on the edges
-                    F_ = (F_[0] * len(e_t), F_[1] * len(e_t)) if not h_t else F_
-                    mode = "split" if not h_t else mode
-                fo_list.append({"F": F_, "mode": mode, "holes": h_t,
-                                "edge_segs": [sg for i in e_t for sg in seg_of(i)]})
-            ss.pending_bc = {"hole_map": T["hole_map"], "hole_fix": dict(ss.hole_fix),
-                             "fixed_segs": [sg for i in ss.supports for sg in seg_of(i)], "forces": fo_list}
-            ss.opt_geom = {"geom": tgeo, "name": f"{Path(name).stem} · optimised {100 * T['vf']:g}%",
-                           "key": f"opt_{gkey}_{T['vf']}_{len(tgeo['outline'])}_{len(tgeo['poly_holes'])}"}
+with tab_opt:
+    # ------------------------------------------------------------------ 05 · topology optimisation
+    st.markdown('<p class="eyebrow">Topology optimisation (SIMP, minimum compliance): keeps the stiffest '
+                'layout of material for a target volume, using the supports and loads above. Material around '
+                'loaded / fixed holes and edges is always kept.</p>', unsafe_allow_html=True)
+    if not ready:
+        st.markdown('<p class="eyebrow">→ Set supports and loads first (section 03)</p>', unsafe_allow_html=True)
+    else:
+        o1, o2, o3, o4 = st.columns(4)
+        vf_pct = o1.number_input("Material to keep (%)", min_value=5.0, max_value=95.0, value=40.0, step=5.0,
+                                 format="%g", key="to_vf",
+                                 help="Percentage of the design area kept after optimisation (5-95).")
+        vf = vf_pct / 100.0
+        n_target = int(o2.number_input("Resolution (elements)", min_value=1000, max_value=200000, value=15000,
+                                       step=1000, key="to_res",
+                                       help="Number of triangles in the optimisation mesh. More = finer struts and "
+                                            "smoother shape, but slower: roughly 10 s per 15,000 elements on a PC "
+                                            "(longer online). 6,000 = quick look, 15,000 = default, 30,000+ = fine."))
+        n_iter = int(o3.number_input("Iterations", min_value=10, max_value=500, value=80, step=10, key="to_iter",
+                                     help="Optimisation steps. It stops earlier once the design stops changing."))
+        start = o4.radio("Start from", ["solid", "current"], key="to_start", horizontal=True,
+                         format_func={"solid": "Solid outline", "current": "Current shape"}.get,
+                         help="Solid outline ignores existing cutouts (bolt holes are always kept).")
+        fil_r = o1.number_input("Fillet radius on new shape (mm)", value=3.0, min_value=0.0, step=0.5, format="%g",
+                                key="to_fil",
+                                help="Every corner of the optimised shape is rounded with this radius, as you would "
+                                     "do in CAD before making it (no singularities left; the stress at each fillet is "
+                                     "then a real, converged FE value). 0 keeps sharp corners so EigenStress predicts "
+                                     "their real stress for the corner radius set in the sidebar.")
+        run_opt = st.button("Optimise", key="to_run")
+        prog = st.empty()                    # fixed slot for the progress bar (keeps the layout stable)
+        if run_opt:
+            part0 = build_part(geom, edges, ss.supports, loads, thickness, E, nu, rho, hole_bc)
+            if start == "solid":
+                part0 = dict(part0)
+                part0["poly_holes"] = []
+            from shapely.geometry import Polygon as _Pg
+            design_area = _Pg(geom["outline"]).area - sum(np.pi * r_ ** 2 for _, r_ in geom["circles"])
+            hsel = float(np.sqrt(max(design_area, 1e-9) / (0.43 * n_target)))   # ~equilateral triangles
+            bar = prog.progress(0.0, text="Optimising…")
+
+            def cb(i, n, c, v):
+                bar.progress(i / n, text=f"Iteration {i}/{n} · compliance {c:.4g} · volume {v:.2f}")
+            try:
+                from sing_tool import min_wall
+                if part0.get("poly_holes"):
+                    hsel = min(hsel, max(min_wall(part0) / 2.5, hsel / 3))
+                tres = optimise(part0, volfrac=vf, h=hsel, iters=n_iter, callback=cb)
+                tgeo, hmap = extract_shape(tres, part0, round_r=float(fil_r))
+                if not tgeo.get("connected", True):
+                    st.warning("The optimised layout splits into separate pieces at this resolution / material "
+                               "fraction, so it cannot be analysed as one part. Try more material or a finer resolution.")
+                ss.topo = {"res": tres, "geo": tgeo, "hole_map": hmap, "part": part0, "vf": vf, "fil_r": float(fil_r)}
+            except Exception as ex:
+                st.error(f"Optimisation failed: {ex}")
+            prog.empty()
+        if ss.get("topo"):
+            T = ss.topo
+            tres, tgeo = T["res"], T["geo"]
+            hst = pd.DataFrame(tres["history"])
+            t1, t2, t3, t4 = st.columns(4)
+            t1.metric("Material kept", f"{100 * tgeo['volume_kept']:.0f}%")
+            t2.metric("Mass saved", f"{100 * (1 - tgeo['volume_kept']):.0f}%")
+            rel = tres["c_full"] / hst.compliance.iloc[-1]
+            t3.metric("Stiffness vs solid", f"{100 * rel:.0f}%",
+                      help="Compliance of the full solid part divided by the optimised compliance "
+                           "(100% = as stiff as the solid part).")
+            t4.metric("Iterations", len(hst))
+            cA, cB = st.columns(2)
+            mo = tres["mesh"]
+            figd, axd = plt.subplots(figsize=(7, 5), facecolor=BG)
+            axd.set_facecolor(BG)
+            axd.tripcolor(mo.p[0], mo.p[1], mo.t.T, facecolors=tres["density"], cmap="gray", vmin=0, vmax=1)
+            axd.set_aspect("equal"); axd.axis("off")
+            axd.set_title("DENSITY (WHITE = MATERIAL)", color="#8c8c8c", fontsize=9, family="monospace", loc="left")
+            cA.pyplot(figd, width="stretch")
+            figs, axs = plt.subplots(figsize=(7, 5), facecolor=BG)
+            axs.set_facecolor(BG)
+            o_ = np.array(tgeo["outline"] + [tgeo["outline"][0]])
+            axs.fill(o_[:, 0], o_[:, 1], color="#5a5a5a"); axs.plot(o_[:, 0], o_[:, 1], color=FG, lw=1)
+            for hh in tgeo["poly_holes"]:
+                hh = np.array(hh + [hh[0]]); axs.fill(hh[:, 0], hh[:, 1], color=BG); axs.plot(hh[:, 0], hh[:, 1], color=FG, lw=1)
+            for c_, r_ in tgeo["circles"]:
+                tt = np.linspace(0, 2 * np.pi, 60)
+                axs.fill(c_[0] + r_ * np.cos(tt), c_[1] + r_ * np.sin(tt), color=BG)
+                axs.plot(c_[0] + r_ * np.cos(tt), c_[1] + r_ * np.sin(tt), color=FG, lw=1)
+            axs.set_aspect("equal"); axs.axis("off")
+            axs.set_title(f"EXTRACTED SHAPE · {len(tgeo['poly_holes'])} CUTOUTS", color="#8c8c8c", fontsize=9,
+                          family="monospace", loc="left")
+            cB.pyplot(figs, width="stretch")
+            if ss.topo.get("fil_r", 0) > 0:
+                st.caption(f"The density field is smoothed into a clean outline and every corner is filleted with "
+                           f"r = {ss.topo['fil_r']:g} mm, so the new part has no stress singularities: EigenStress reports "
+                           "real, converged stresses at the fillets. Set the fillet radius to 0 to keep sharp corners "
+                           "and have EigenStress predict their real stress instead.")
+            else:
+                st.caption("Sharp corners kept where struts meet. Send it to EigenStress to see which are singular and "
+                           "what their real stress is for the corner radius in the sidebar.")
+            import tempfile, os
+            fd, tmpdxf = tempfile.mkstemp(suffix=".dxf"); os.close(fd)
+            write_dxf(tgeo, tmpdxf)
+            dxf_bytes = open(tmpdxf, "rb").read(); os.remove(tmpdxf)
+            b1, b2 = st.columns(2)
+            b1.download_button("Download optimised shape (DXF)", dxf_bytes,
+                               file_name=f"{Path(name).stem}_optimised_{100 * T['vf']:g}pct.dxf")
+            if b2.button("Analyse optimised shape with EigenStress →", width="stretch"):
+                n_e_old = len(edges)
+                seg_of = lambda i: [(tuple(p), tuple(q)) for p, q in edges[i]["segs"]]
+                fo_list = []
+                for fo in ss.forces:
+                    e_t = [t for t in fo["targets"] if t < n_e_old]
+                    h_t = [t - n_e_old for t in fo["targets"] if t >= n_e_old]
+                    F_ = fo["F"]
+                    mode = fo["mode"]
+                    if mode == "each" and e_t:                 # keep the same total force on the edges
+                        F_ = (F_[0] * len(e_t), F_[1] * len(e_t)) if not h_t else F_
+                        mode = "split" if not h_t else mode
+                    fo_list.append({"F": F_, "mode": mode, "holes": h_t,
+                                    "edge_segs": [sg for i in e_t for sg in seg_of(i)]})
+                ss.pending_bc = {"hole_map": T["hole_map"], "hole_fix": dict(ss.hole_fix),
+                                 "fixed_segs": [sg for i in ss.supports for sg in seg_of(i)], "forces": fo_list}
+                ss.opt_geom = {"geom": tgeo, "name": f"{Path(name).stem} · optimised {100 * T['vf']:g}%",
+                               "key": f"opt_{gkey}_{T['vf']}_{len(tgeo['outline'])}_{len(tgeo['poly_holes'])}"}
+                ss.goto_tab = TAB_AN
             st.rerun()
 
 with st.expander("How it works"):
