@@ -24,6 +24,7 @@ from corner_tools import corner_features, sampler_from_mesh, corner_length
 
 MESH_DIVS = (10, 20, 40, 80)
 FAMILY = "bracket"
+RHO_RANGE = (0.01, 0.3)          # fillet radius / l sampled for the targets
 N_RADII = 3
 
 
@@ -51,6 +52,32 @@ def notched_plate(W, H, x0, depth, omega_deg):
     return poly, 4, [((0.0, H), (0.0, 0.0))], (np.array([W, 0.0]), np.array([W, H]))
 
 
+def stepped_bar(D, d, Lb, two_sided, tilt_deg):
+    """Flat bar with a shoulder (one- or two-sided). Step face can lean by tilt_deg. Returns corners to fillet."""
+    h = (D - d) / 2 if two_sided else D - d
+    dx = h * np.tan(np.radians(tilt_deg))
+    if two_sided:
+        y0 = h
+        pts = [(0, 0), (Lb + dx, 0), (Lb, y0), (2 * Lb, y0), (2 * Lb, y0 + d), (Lb, y0 + d), (Lb + dx, D), (0, D)]
+        ic, others = 2, [5]
+        end = (np.array([2 * Lb, y0]), np.array([2 * Lb, y0 + d]))
+    else:
+        pts = [(0, 0), (2 * Lb, 0), (2 * Lb, d), (Lb, d), (Lb + dx, D), (0, D)]
+        ic, others = 3, []
+        end = (np.array([2 * Lb, 0.0]), np.array([2 * Lb, d]))
+    poly = [np.array(p, float) for p in pts]
+    return poly, ic, others, [((0.0, D), (0.0, 0.0))], end
+
+
+def max_fillet(poly, i):
+    """Largest radius whose tangent points stay inside 80 % of both adjacent edges."""
+    from fe2d import interior_angles as _ia
+    n = len(poly)
+    psi = np.radians(360.0 - _ia(poly)[i])
+    adj = min(np.linalg.norm(poly[i] - poly[i - 1]), np.linalg.norm(poly[(i + 1) % n] - poly[i]))
+    return 0.8 * adj * np.tan(psi / 2)
+
+
 def peak_near(m, s, P, radius):
     d = np.linalg.norm(m.p.T - P, axis=1)
     return float(s["vm"][d < radius].max())
@@ -60,7 +87,19 @@ def run_geometry(seed):
     rng = np.random.default_rng(seed)
     gam = rng.uniform(0, 2 * np.pi)
     q = rng.uniform(5, 50)
-    if FAMILY == "bracket":
+    others = []
+    if FAMILY == "stepped":
+        D = rng.uniform(20, 60)
+        d = D * rng.uniform(0.35, 0.9)
+        two = bool(rng.random() < 0.5)
+        Lb = rng.uniform(1.5, 3.0) * D
+        tilt = rng.uniform(-25, 40) if rng.random() < 0.4 else 0.0
+        poly, ic, others, fixed, (ea, eb) = stepped_bar(D, d, Lb, two, tilt)
+        from fe2d import interior_angles as _ia
+        psi = 360.0 - _ia(poly)[ic]
+        hg = d / 5
+        geo = {"family": "stepped", "a": D, "L1": d, "L2": Lb}
+    elif FAMILY == "bracket":
         a = rng.uniform(10, 30)
         L1, L2 = rng.uniform(3, 6, 2) * a
         psi = rng.uniform(50, 170)
@@ -83,17 +122,22 @@ def run_geometry(seed):
     P = np.asarray(poly[ic])
     geo.update({"seed": seed, "psi": psi, "load_angle": np.degrees(gam), "q": q})
 
-    radii = np.sort(np.exp(rng.uniform(np.log(0.01), np.log(0.3), N_RADII))) * ell
+    radii = np.sort(np.exp(rng.uniform(np.log(RHO_RANGE[0]), np.log(RHO_RANGE[1]), N_RADII))) * ell
+    rmax = min([max_fillet(poly, ic)] + [max_fillet(poly, o) for o in others])
+    radii = radii[radii < rmax]
+    if len(radii) == 0:
+        return []
     targets = []
     for rho in radii:
-        m = mesh_polygon(poly, fillets={ic: rho}, refine=[(ic, rho / 12)], h_global=hg)
+        fil = {ic: rho, **{o: rho for o in others}}
+        m = mesh_polygon(poly, fillets=fil, refine=[(k, rho / 12) for k in fil], h_global=min(hg, rho * 4 + hg / 2))
         s = solve_plane_stress(m, fixed, trac)
         targets.append(peak_near(m, s, P, 3 * rho / np.sin(np.radians(psi) / 2) + 0.05 * ell))
 
     rows = []
     for k in MESH_DIVS:
         h = ell / k
-        m = mesh_polygon(poly, refine=[(ic, h)], h_global=hg)
+        m = mesh_polygon(poly, refine=[(ic, h)] + [(o, h) for o in others], h_global=hg)
         s = solve_plane_stress(m, fixed, trac)
         f = corner_features(sampler_from_mesh(m, s), poly, ic, h)
         if f is None:
@@ -111,13 +155,16 @@ def main():
     ap.add_argument("--out", default="dataset.csv")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--seed0", type=int, default=0)
-    ap.add_argument("--family", default="bracket", choices=["bracket", "notched_plate"])
+    ap.add_argument("--family", default="bracket", choices=["bracket", "notched_plate", "stepped"])
+    ap.add_argument("--rho-min", type=float, default=0.01)
+    ap.add_argument("--rho-max", type=float, default=0.3)
     args = ap.parse_args()
-    global FAMILY
+    global FAMILY, RHO_RANGE
     FAMILY = args.family
+    RHO_RANGE = (args.rho_min, args.rho_max)
     t0 = time.time()
     rows, fails = [], 0
-    with Pool(args.workers, initializer=_set_family, initargs=(args.family,)) as pool:
+    with Pool(args.workers, initializer=_set_family, initargs=(args.family, RHO_RANGE)) as pool:
         for i, res in enumerate(pool.imap_unordered(_safe, range(args.seed0, args.seed0 + args.n))):
             if res is None:
                 fails += 1
@@ -131,9 +178,9 @@ def main():
     print(f"done: {len(rows)} rows, {fails} failed, {time.time() - t0:.0f}s")
 
 
-def _set_family(f):
-    global FAMILY
-    FAMILY = f
+def _set_family(f, rr=(0.01, 0.3)):
+    global FAMILY, RHO_RANGE
+    FAMILY, RHO_RANGE = f, rr
 
 
 def _safe(seed):

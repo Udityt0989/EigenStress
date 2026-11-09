@@ -21,7 +21,7 @@ import streamlit as st
 from fe2d import interior_angles, signed_area
 from geometry_io import read_dxf, write_sample_dxfs
 from corner_tools import corner_features
-from sing_tool import solve_two_meshes, analyse, max_regular_stress, predict
+from sing_tool import solve_two_meshes, analyse, max_regular_stress, predict, scan_holes
 
 HERE = Path(__file__).parent
 SAMPLES = HERE / "samples"
@@ -124,30 +124,63 @@ def edge_groups(outline):
     return out
 
 
-def geometry_figure(geom, edges, supports, loads, picked, height=520):
+def _arc_xy(c, r, a0, a1, n=60):
+    t = np.radians(np.linspace(a0, a1, n))
+    return c[0] + r * np.cos(t), c[1] + r * np.sin(t)
+
+
+def geometry_figure(geom, edges, supports, loads, selection, hole_bc=None, height=520):
+    hole_bc = hole_bc or {}
+    selection = set(selection or ())
+    n_e = len(edges)
     fig = go.Figure()
     for idx, e in enumerate(edges):
         pts = np.array([e["segs"][0][0]] + [q for _, q in e["segs"]])
         if idx in supports:
             color, width, name = C_SUPPORT, 7, "support"
-        elif idx in loads:
+        elif idx in loads and idx not in selection:
             color, width, name = C_LOAD, 3, "load"
-        elif idx == picked:
+        elif idx in selection:
             color, width, name = C_PICK, 6, "selected"
         else:
             color, width, name = C_EDGE, 2.5, "edge"
         fig.add_trace(go.Scatter(x=pts[:, 0], y=pts[:, 1], mode="lines",
                                  line=dict(color=color, width=width, dash="dot" if name == "load" else "solid"),
                                  hoverinfo="skip", showlegend=False))
-    for (c, r) in geom["circles"]:
-        t = np.linspace(0, 2 * np.pi, 80)
-        fig.add_trace(go.Scatter(x=c[0] + r * np.cos(t), y=c[1] + r * np.sin(t), mode="lines",
-                                 line=dict(color=C_EDGE, width=2), hoverinfo="skip", showlegend=False))
+    size = np.ptp(np.array(geom["outline"]), axis=0).max()
+    for j, (c, r) in enumerate(geom["circles"]):
+        sel = (n_e + j) in selection
+        x, y = _arc_xy(c, r, 0, 360, 90)
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=C_PICK if sel else C_EDGE, width=4 if sel else 2),
+                                 hoverinfo="skip", showlegend=False))
+        bc = hole_bc.get(j)
+        if bc is None:
+            continue
+        if bc["type"] == "fixed":
+            fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=C_SUPPORT, width=7),
+                                     hoverinfo="skip", showlegend=False))
+        elif bc["type"] == "pin":
+            ax_, ay_ = _arc_xy(c, r, bc["angle"] - 90, bc["angle"] + 90)
+            fig.add_trace(go.Scatter(x=ax_, y=ay_, mode="lines", line=dict(color=C_SUPPORT, width=7),
+                                     hoverinfo="skip", showlegend=False))
+        elif bc["type"] == "bearing":
+            fx, fy = bc["F"]
+            mag = np.hypot(fx, fy)
+            if mag > 0:
+                th = np.degrees(np.arctan2(fy, fx))
+                ax_, ay_ = _arc_xy(c, r, th - 90, th + 90)
+                fig.add_trace(go.Scatter(x=ax_, y=ay_, mode="lines", line=dict(color=C_LOAD, width=3, dash="dot"),
+                                         hoverinfo="skip", showlegend=False))
+                d = np.array([fx, fy]) / mag * max(size * 0.10, 2.5 * r)
+                fig.add_annotation(x=c[0] + d[0], y=c[1] + d[1], ax=c[0], ay=c[1], xref="x", yref="y",
+                                   axref="x", ayref="y", showarrow=True, arrowhead=3, arrowsize=1.4,
+                                   arrowwidth=2.5, arrowcolor=C_LOAD, text="")
+                fig.add_annotation(x=c[0] + 1.25 * d[0], y=c[1] + 1.25 * d[1], showarrow=False,
+                                   text=f"{mag:.0f} N", font=dict(color=FG, size=11, family=MONO))
     for h in geom["poly_holes"]:
         p = np.array(h + [h[0]])
         fig.add_trace(go.Scatter(x=p[:, 0], y=p[:, 1], mode="lines", line=dict(color=C_EDGE, width=2),
                                  hoverinfo="skip", showlegend=False))
-    size = np.ptp(np.array(geom["outline"]), axis=0).max()
     for idx, (fx, fy) in loads.items():
         m = edges[idx]["mid"]
         mag = np.hypot(fx, fy)
@@ -157,14 +190,20 @@ def geometry_figure(geom, edges, supports, loads, picked, height=520):
                                axref="x", ayref="y", showarrow=True, arrowhead=3, arrowsize=1.4,
                                arrowwidth=2.5, arrowcolor=C_LOAD,
                                text=f"{mag:.0f} N", font=dict(color=FG, size=12, family=MONO))
-    mids = np.array([e["mid"] for e in edges])
+    mids = [e["mid"] for e in edges] + [np.asarray(c, float) for c, _ in geom["circles"]]
+    mids = np.array(mids)
+    labels = [f"E{i}" for i in range(n_e)] + [f"H{j}" for j in range(len(geom["circles"]))]
+    ids = list(range(len(labels)))
     fig.add_trace(go.Scatter(
-        x=mids[:, 0], y=mids[:, 1], mode="markers+text", text=[f"E{i}" for i in range(len(edges))],
-        textposition="top center", textfont=dict(color=FG, size=12, family=MONO),
-        marker=dict(size=14, symbol="square", color=[C_PICK if i == picked else BG for i in range(len(edges))],
-                    line=dict(color=[C_PICK if i == picked else "#8c8c8c" for i in range(len(edges))], width=1.5)),
-        customdata=list(range(len(edges))),
-        hovertemplate="E%{customdata}: click to select<extra></extra>", showlegend=False))
+        x=mids[:, 0], y=mids[:, 1], mode="markers+text", text=labels,
+        textfont=dict(color=FG, size=12, family=MONO),
+        textposition=["top center"] * n_e + ["bottom right"] * (len(ids) - n_e),
+        marker=dict(size=14, symbol=["square"] * n_e + ["circle"] * (len(ids) - n_e),
+                    color=[C_PICK if i in selection else BG for i in ids],
+                    line=dict(color=[C_PICK if i in selection else "#8c8c8c" for i in ids], width=1.5)),
+        customdata=ids,
+        hovertext=labels, hovertemplate="%{hovertext}: click to add / remove from selection<extra></extra>",
+        showlegend=False))
     fig.update_layout(height=height, margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor=BG, paper_bgcolor=BG,
                       font=dict(family=MONO, color="#8c8c8c", size=11),
                       hoverlabel=dict(bgcolor=SURFACE, bordercolor=FG, font=dict(family=MONO, color=FG)),
@@ -175,7 +214,46 @@ def geometry_figure(geom, edges, supports, loads, picked, height=520):
     return fig
 
 
-def build_part(geom, edges, supports, loads, thickness, E, nu, rho):
+def edge_loads_from(forces, edges):
+    """Total force (N) on each edge from all force groups. 'split' shares a total by edge length."""
+    out = {}
+    for f in forces:
+        tg = [t for t in f["targets"] if t < len(edges)]
+        if not tg:
+            continue
+        Ltot = sum(edges[t]["length"] for t in tg)
+        for t in tg:
+            k = edges[t]["length"] / Ltot if f["mode"] == "split" else 1.0
+            fx, fy = out.get(t, (0.0, 0.0))
+            out[t] = (fx + k * f["F"][0], fy + k * f["F"][1])
+    return out
+
+
+def hole_forces_from(forces, n_e):
+    """List of bearing forces (N) per hole from all force groups. 'split' shares a total equally (bolt group)."""
+    out = {}
+    for f in forces:
+        tg = [t - n_e for t in f["targets"] if t >= n_e]
+        if not tg:
+            continue
+        k = 1.0 / len(tg) if f["mode"] == "split" else 1.0
+        for j in tg:
+            out.setdefault(j, []).append((k * f["F"][0], k * f["F"][1], f["name"]))
+    return out
+
+
+def hole_bc_full(hole_fix, hole_forces):
+    """Fixtures + bearing resultants (a bolt carries the vector sum of all forces put through it)."""
+    hb = {j: dict(b) for j, b in hole_fix.items()}
+    for j, fl in hole_forces.items():
+        if j in hb:                                   # fixed / pinned hole: bearing ignored
+            continue
+        R_ = (sum(f[0] for f in fl), sum(f[1] for f in fl))
+        hb[j] = {"type": "bearing", "F": R_, "parts": fl}
+    return hb
+
+
+def build_part(geom, edges, supports, loads, thickness, E, nu, rho, hole_bc=None):
     fixed, trac = [], []
     for idx in supports:
         fixed += [(tuple(p), tuple(q)) for p, q in edges[idx]["segs"]]
@@ -183,12 +261,29 @@ def build_part(geom, edges, supports, loads, thickness, E, nu, rho):
         L = edges[idx]["length"]
         tx, ty = fx / (L * thickness), fy / (L * thickness)          # N / mm^2 = MPa
         trac += [(tuple(p), tuple(q), (tx, ty)) for p, q in edges[idx]["segs"]]
+    hb = {}
+    for j, bc in (hole_bc or {}).items():
+        bc = dict(bc)
+        if bc["type"] == "bearing":
+            bc["F"] = (bc["F"][0] / thickness, bc["F"][1] / thickness)  # solver works per unit thickness
+        hb[j] = bc
     return {"poly": [np.asarray(p, float) for p in geom["outline"]], "circles": geom["circles"],
-            "poly_holes": geom["poly_holes"], "fixed": fixed, "traction": trac,
+            "poly_holes": geom["poly_holes"], "fixed": fixed, "traction": trac, "hole_bc": hb,
             "E": E, "nu": nu, "corner_radius": rho}
 
 
-def result_figure(part, sols, flags, regular):
+def support_problem(supports, hole_bc):
+    """Return a message if the supports cannot hold the part still (rigid-body mechanism), else None."""
+    full = len(supports) + sum(1 for b in hole_bc.values() if b["type"] == "fixed")
+    pins = sum(1 for b in hole_bc.values() if b["type"] == "pin")
+    if full == 0 and pins == 0:
+        return "Add a support: fix an edge, fix a hole, or pin a hole."
+    if full == 0 and pins == 1:
+        return ("A single pin lets the part swing around it. Add a second pin, a fixed hole, or a fixed edge.")
+    return None
+
+
+def result_figure(part, sols, flags, regular, hole_summary=()):
     from matplotlib.colors import LinearSegmentedColormap
     f = sols["fine"]
     m, vm = f["m"], f["vm"]
@@ -210,15 +305,19 @@ def result_figure(part, sols, flags, regular):
     for _, r in flags[flags.singular].iterrows():
         geo = r.type == "sharp re-entrant corner"
         ax.plot(r.x, r.y, "o", ms=14, mfc="none", mec=C_SING if geo else "#8c8c8c", mew=2)
-        lab = f"V{int(r.vertex)}"
+        lab = r.label
         if geo and np.isfinite(r.get("predicted_real_stress", np.nan)):
             lab += f" → {r.predicted_real_stress:.0f} MPA"
-        ax.annotate(lab, (r.x, r.y), xytext=(10, 10), textcoords="offset points", fontsize=9, color=FG,
-                    family=mono, bbox=box)
+        ax.annotate(lab, (r.x, r.y), xytext=(12, -22) if geo else (10, 10), textcoords="offset points",
+                    fontsize=9, color=FG, family=mono, bbox=box, zorder=6 if geo else 4)
+    for h in hole_summary:
+        ax.plot(h["x"], h["y"], "D", ms=7, mfc="none", mec=FG, mew=1.4)
+        ax.annotate(f"{h['hole']} PEAK {h['peak_stress']:.0f}", (h["x"], h["y"]), xytext=(10, -14),
+                    textcoords="offset points", fontsize=8, color=FG, family=mono, bbox=box)
     v, p = regular["fine"]
     ax.plot(*p, "s", ms=9, mfc="none", mec=FG, mew=1.6)
-    ax.annotate(f"MAX ELSEWHERE {v:.0f} MPA", p, xytext=(10, -16), textcoords="offset points", fontsize=9,
-                color=FG, family=mono, bbox=box)
+    ax.annotate(f"MAX ELSEWHERE {v:.0f} MPA", p, xytext=(12, 10), textcoords="offset points", fontsize=9,
+                color=FG, family=mono, bbox=box, zorder=5)
     ax.plot([], [], "o", ms=10, mfc="none", mec=C_SING, mew=2, label="SHARP CORNER · REAL STRESS PREDICTED")
     ax.plot([], [], "o", ms=10, mfc="none", mec="#8c8c8c", mew=2, label="SUPPORT / LOAD ARTEFACT")
     ax.plot([], [], "s", ms=9, mfc="none", mec=FG, mew=1.6, label="MAX CONVERGED STRESS ELSEWHERE")
@@ -230,39 +329,187 @@ def result_figure(part, sols, flags, regular):
     return fig
 
 
-def report_text(name, settings, supports, loads, edges, flags, regular):
-    lines = [f"# Singularity report: {name}", "",
+# ------------------------------------------------------------------ contour fields + probe
+FIELDS = {
+    "vm": ("von Mises stress", "MPa"), "s1": ("Max principal stress σ1", "MPa"),
+    "s2": ("Min principal stress σ2", "MPa"), "tmax": ("Max in-plane shear stress", "MPa"),
+    "sx": ("Normal stress σx", "MPa"), "sy": ("Normal stress σy", "MPa"), "txy": ("Shear stress τxy", "MPa"),
+    "e1": ("Max principal strain ε1", "µε"), "ex": ("Normal strain εx", "µε"),
+    "ey": ("Normal strain εy", "µε"), "gxy": ("Shear strain γxy", "µε"),
+}
+
+
+def field_values(s, E, nu):
+    """All contour fields at the mesh nodes (plane stress, linear elastic). Strains in microstrain."""
+    sx, sy, txy = s["sx"], s["sy"], s["txy"]
+    c, r = (sx + sy) / 2, np.sqrt(((sx - sy) / 2) ** 2 + txy ** 2)
+    ex, ey, gxy = (sx - nu * sy) / E, (sy - nu * sx) / E, 2 * (1 + nu) * txy / E
+    e1 = (ex + ey) / 2 + np.sqrt(((ex - ey) / 2) ** 2 + (gxy / 2) ** 2)
+    return {"vm": s["vm"], "s1": c + r, "s2": c - r, "tmax": r, "sx": sx, "sy": sy, "txy": txy,
+            "e1": 1e6 * e1, "ex": 1e6 * ex, "ey": 1e6 * ey, "gxy": 1e6 * gxy}
+
+
+def singular_mask(xy, flags, frac=0.3):
+    """True for nodes within frac*l of any flagged singular point."""
+    near = np.zeros(len(xy), bool)
+    for _, r in flags[flags.singular].iterrows():
+        near |= np.linalg.norm(xy - np.array([r.x, r.y]), axis=1) < frac * r.ell
+    return near
+
+
+def contour_grid(px, py, tri, vals, n=220):
+    """Interpolate a nodal field onto a regular grid (NaN outside the part, incl. holes)."""
+    from matplotlib.tri import Triangulation, LinearTriInterpolator
+    T = Triangulation(np.asarray(px), np.asarray(py), np.asarray(tri))
+    x0, x1, y0, y1 = float(np.min(px)), float(np.max(px)), float(np.min(py)), float(np.max(py))
+    L = max(x1 - x0, y1 - y0)
+    nx = max(20, int(n * (x1 - x0) / L))
+    ny = max(20, int(n * (y1 - y0) / L))
+    gx, gy = np.linspace(x0, x1, nx), np.linspace(y0, y1, ny)
+    X, Y = np.meshgrid(gx, gy)
+    Z = LinearTriInterpolator(T, np.asarray(vals))(X, Y)
+    return gx, gy, np.ma.filled(Z, np.nan)
+
+
+def probe_values(m, fields, pts):
+    from matplotlib.tri import Triangulation, LinearTriInterpolator
+    T = Triangulation(m.p[0], m.p[1], m.t.T)
+    out = []
+    for (x, y) in pts:
+        row = {"x": x, "y": y}
+        for k, v in fields.items():
+            val = LinearTriInterpolator(T, v)(x, y)
+            row[k] = float(val) if not np.ma.is_masked(val) else np.nan
+        out.append(row)
+    return out
+
+
+CMAPS = {"Mono": [[0, "#1c1c1c"], [0.5, "#5a5a5a"], [1, "#f2f2f2"]],
+         "ANSYS-style": [[0, "#0000ff"], [0.25, "#00b4ff"], [0.5, "#00ff00"], [0.75, "#ffff00"], [1, "#ff0000"]]}
+
+
+def contour_figure(gx, gy, Z, lo, hi, levels, cmap, unit, probes, extremes, height=560):
+    fig = go.Figure()
+    fig.add_trace(go.Contour(
+        x=gx, y=gy, z=Z, zmin=lo, zmax=hi, colorscale=CMAPS[cmap], connectgaps=False,
+        contours=dict(start=lo, end=hi, size=(hi - lo) / max(levels, 1), coloring="fill", showlines=False),
+        colorbar=dict(title=dict(text=unit, font=dict(family=MONO, color="#8c8c8c", size=11)),
+                      tickfont=dict(family=MONO, color="#8c8c8c", size=10), outlinewidth=0, thickness=14),
+        hoverinfo="skip"))
+    # invisible click / hover layer: one point per grid cell inside the part
+    X, Y = np.meshgrid(gx, gy)
+    ok = np.isfinite(Z)
+    fig.add_trace(go.Scattergl(
+        x=X[ok], y=Y[ok], mode="markers", marker=dict(size=7, color="rgba(0,0,0,0)"),
+        customdata=Z[ok], hovertemplate=f"x %{{x:.2f}} · y %{{y:.2f}}<br>%{{customdata:.4g}} {unit}<extra></extra>",
+        showlegend=False))
+    for kind, (x, y, v) in extremes.items():
+        side = "right" if x < (gx[0] + gx[-1]) / 2 else "left"
+        fig.add_trace(go.Scatter(x=[x], y=[y], mode="markers+text", text=[f"{kind} {v:.4g}"],
+                                 textposition=("top " if kind == "MAX" else "bottom ") + side, textfont=dict(family=MONO, color=FG, size=11),
+                                 marker=dict(symbol="triangle-up" if kind == "MAX" else "triangle-down", size=13,
+                                             color=BG, line=dict(color=FG, width=2)),
+                                 hoverinfo="skip", showlegend=False))
+    for i, pr in enumerate(probes):
+        fig.add_trace(go.Scatter(x=[pr["x"]], y=[pr["y"]], mode="markers+text", text=[f"P{i + 1}"],
+                                 textposition="bottom right", textfont=dict(family=MONO, color=FG, size=11),
+                                 marker=dict(symbol="x-thin", size=14, line=dict(color=FG, width=2.5)),
+                                 hoverinfo="skip", showlegend=False))
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor=BG, paper_bgcolor=BG,
+                      font=dict(family=MONO, color="#8c8c8c", size=11), dragmode="pan", clickmode="event+select",
+                      hoverlabel=dict(bgcolor=SURFACE, bordercolor=FG, font=dict(family=MONO, color=FG)))
+    pad = 0.06 * max(gx[-1] - gx[0], gy[-1] - gy[0])
+    fig.update_xaxes(showgrid=False, zeroline=False, linecolor=BORDER, title="X (MM)", range=[gx[0] - pad, gx[-1] + pad])
+    fig.update_yaxes(showgrid=False, zeroline=False, linecolor=BORDER, scaleanchor="x", scaleratio=1, title="Y (MM)",
+                     range=[gy[0] - pad, gy[-1] + pad])
+    return fig
+
+
+def mesh_stats(m):
+    e = np.concatenate([m.t[[0, 1]], m.t[[1, 2]], m.t[[2, 0]]], axis=1)
+    L = np.linalg.norm(m.p[:, e[0]] - m.p[:, e[1]], axis=0)
+    return {"nodes": m.p.shape[1], "elements": m.t.shape[1], "dof": 2 * (m.p.shape[1] + m.facets.shape[1]),
+            "h_min": float(L.min()), "h_max": float(L.max())}
+
+
+def mesh_figure(m, flags, hole_summary, center=None, half=None, title=""):
+    mono = ["Courier New", "Courier", "DejaVu Sans Mono", "monospace"]
+    fig, ax = plt.subplots(figsize=(8, 6), facecolor=BG)
+    ax.set_facecolor(BG)
+    lw = 0.35 if center is None else 0.7
+    ax.triplot(m.p[0], m.p[1], m.t.T, color="#8c8c8c", lw=lw)
+    for _, r in flags[flags.singular].iterrows():
+        geo = r.type == "sharp re-entrant corner"
+        ax.plot(r.x, r.y, "o", ms=12, mfc="none", mec=C_SING if geo else FG, mew=1.8, zorder=5)
+        if center is None or (abs(r.x - center[0]) < half and abs(r.y - center[1]) < half):
+            ax.annotate(r.label, (r.x, r.y), xytext=(9, 9), textcoords="offset points", fontsize=8, color=FG,
+                        family=mono, bbox=dict(boxstyle="square,pad=0.3", fc=BG, ec="#2a2a2a"), zorder=6)
+    ax.set_aspect("equal")
+    if center is not None:
+        ax.set_xlim(center[0] - half, center[0] + half)
+        ax.set_ylim(center[1] - half, center[1] + half)
+    ax.axis("off")
+    if title:
+        ax.set_title(title, color="#8c8c8c", fontsize=9, family=mono, loc="left")
+    fig.tight_layout()
+    return fig
+
+
+def report_text(name, settings, supports, loads, edges, flags, regular, hole_bc=None, hole_summary=(), forces=()):
+    hole_bc = hole_bc or {}
+    hole_lines = []
+    n_e = len(edges)
+    lab = lambda t: f"E{t}" if t < n_e else f"H{t - n_e}"
+    for f in forces:
+        hole_lines.append(f"- Force {f['name']}: Fx = {f['F'][0]:.1f} N, Fy = {f['F'][1]:.1f} N on "
+                          f"{', '.join(lab(t) for t in f['targets'])} "
+                          f"({'total split across these' if f['mode'] == 'split' else 'applied to each'})")
+    for j, b in sorted(hole_bc.items()):
+        if b["type"] == "fixed":
+            hole_lines.append(f"- H{j}: fixed hole (bolted / press-fit)")
+        elif b["type"] == "pin":
+            hole_lines.append(f"- H{j}: pin support, contact side centred at {b['angle']:g} deg (180 deg patch)")
+        else:
+            hole_lines.append(f"- H{j}: bolt bearing, resultant Fx = {b['F'][0]:.1f} N, Fy = {b['F'][1]:.1f} N")
+    lines = [f"# EigenStress report: {name}", "",
              f"Thickness {settings['t']} mm, E = {settings['E']:.0f} MPa, nu = {settings['nu']}, "
              f"plane stress, linear elastic.", "",
              "## Boundary conditions",
              *[f"- E{i}: fixed support (length {edges[i]['length']:.1f} mm)" for i in supports],
-             *[f"- E{i}: force Fx = {fx:.1f} N, Fy = {fy:.1f} N" for i, (fx, fy) in loads.items()], "",
+             *hole_lines, "",
              "## Singular points", "",
              "| Point | Angle (deg) | Type | FE coarse (MPa) | FE fine (MPa) | Rise on refining | "
              "Corner radius (mm) | Predicted real stress (MPa) | Note |",
              "|---|---|---|---|---|---|---|---|---|"]
     for _, r in flags[flags.singular].iterrows():
         pr = r.get("predicted_real_stress", np.nan)
-        lines.append(f"| V{int(r.vertex)} ({r.x:.1f}, {r.y:.1f}) | {r.angle_deg:.0f} | {r.type} | "
+        ang = "-" if not np.isfinite(r.angle_deg) else f"{r.angle_deg:.0f}"
+        lines.append(f"| {r.label} ({r.x:.1f}, {r.y:.1f}) | {ang} | {r.type} | "
                      f"{r.fe_stress_coarse:.1f} | {r.fe_stress_fine:.1f} | x{r.refine_ratio:.2f} | "
                      f"{r.get('corner_radius', np.nan) if r.type.startswith('sharp') else '-'} | "
                      f"{'-' if not np.isfinite(pr) else f'{pr:.1f}'} | {r.get('note', '') if isinstance(r.get('note', ''), str) else ''} |")
+    if hole_summary:
+        lines += ["", "## Holes", "", "| Hole | Fixture | Dia (mm) | Peak stress (MPa) | At angle (deg) | "
+                  "Change vs coarse mesh | Singular points |", "|---|---|---|---|---|---|---|"]
+        for h in hole_summary:
+            lines.append(f"| {h['hole']} | {h['fixture']} | {2 * h['radius_mm']:.1f} | {h['peak_stress']:.1f} | "
+                         f"{h['at_angle_deg']:.0f} | {h['change_pct']:+.1f}% | {h['singular_points']} |")
     v_c, v_f = regular["coarse"][0], regular["fine"][0]
     lines += ["", f"Highest converged stress away from singular points: {v_f:.1f} MPa at "
                   f"({regular['fine'][1][0]:.1f}, {regular['fine'][1][1]:.1f}) "
                   f"(coarse mesh {v_c:.1f} MPa, change {100 * (v_f - v_c) / v_c:+.1f}%).", "",
               "Method: FE solved at two meshes; points whose stress rises >5% when the local mesh is halved are "
               "singular. Sharp corners: the singular field 0.1-0.3 l from the corner (mesh-independent) is fed to "
-              "a model trained on ~49,000 sharp-vs-filleted FE pairs to predict the finite peak stress for the "
-              "given corner radius. Typical accuracy within the trained range: ~2% mean, ~5.5% at the 95th "
+              "a model trained on ~74,000 sharp-vs-filleted FE pairs to predict the finite peak stress for the "
+              "given corner radius. Typical accuracy within the trained range: ~2.6% mean, ~9.6% at the 95th "
               "percentile. Support/load artefacts are not physical stresses and are not predicted."]
     return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ state
 ss = st.session_state
-for k, v in {"supports": set(), "loads": {}, "picked": None, "geom_key": None, "results": None,
-             "pending_pick": None}.items():
+for k, v in {"supports": set(), "forces": [], "hole_fix": {}, "geom_key": None, "results": None,
+             "pending_toggle": None, "force_count": 0}.items():
     ss.setdefault(k, v)
 
 # ------------------------------------------------------------------ sidebar
@@ -303,8 +550,8 @@ except Exception as e:
     st.stop()
 
 if ss.geom_key != gkey:
-    ss.supports, ss.loads, ss.picked, ss.results, ss.geom_key = set(), {}, None, None, gkey
-    ss.pending_pick = 0
+    ss.supports, ss.forces, ss.hole_fix, ss.results, ss.geom_key = set(), [], {}, None, gkey
+    ss.sel_ms, ss.pending_toggle, ss.force_count = [], None, 0
 edges = edge_groups(geom["outline"])
 
 st.markdown('<p class="eyebrow">FEM singularity finder · real-stress predictor</p>', unsafe_allow_html=True)
@@ -315,51 +562,122 @@ st.markdown('<p style="font-size:18px;max-width:640px;margin-top:-4px">Finds the
 col_plot, col_ctrl = st.columns([3, 2], gap="large")
 with col_ctrl:
     st.subheader("03 · Supports + forces")
-    st.write("Click an edge label (E0, E1, …) on the drawing, or pick it here:")
-    opts = list(range(len(edges)))
-    if ss.pending_pick is not None:                 # a click on the drawing selects that edge
-        ss.edge_select = ss.pending_pick
-        ss.pending_pick = None
-    if ss.get("edge_select") not in opts:
-        ss.edge_select = 0
-    sel = st.selectbox("Selected edge", opts,
-                       format_func=lambda i: f"E{i}  ·  {edges[i]['length']:.1f} mm"
-                                             f"{'  (curved)' if edges[i]['curved'] else ''}",
-                       key="edge_select")
-    ss.picked = sel
-    c1, c2 = st.columns(2)
-    if c1.button("Fix this edge (support)", width="stretch"):
-        ss.supports.add(sel)
-        ss.loads.pop(sel, None)
-        ss.results = None
-        st.rerun()
-    if c2.button("Clear this edge", width="stretch"):
-        ss.supports.discard(sel)
-        ss.loads.pop(sel, None)
-        ss.results = None
-        st.rerun()
-    with st.form("force_form", border=True):
-        st.write(f"Force on **E{sel}** (total, spread evenly along the edge)")
-        f1, f2 = st.columns(2)
-        fx = f1.number_input("Fx (N)", value=0.0, format="%g")
-        fy = f2.number_input("Fy (N)", value=-1000.0, format="%g")
-        if st.form_submit_button("Apply force to this edge", width="stretch"):
-            ss.loads[sel] = (fx, fy)
-            ss.supports.discard(sel)
+    n_e, n_h = len(edges), len(geom["circles"])
+    lab = lambda i: f"E{i}" if i < n_e else f"H{i - n_e}"
+    opts = list(range(n_e + n_h))
+    if ss.pending_toggle == "clear":
+        ss.sel_ms, ss.pending_toggle = [], None
+    if ss.pending_toggle is not None:               # a click on the drawing adds / removes that item
+        cur = list(ss.get("sel_ms", []))
+        t = ss.pending_toggle
+        ss.sel_ms = [x for x in cur if x != t] if t in cur else cur + [t]
+        ss.pending_toggle = None
+    ss.sel_ms = [x for x in ss.get("sel_ms", []) if x in opts]
+
+    def _fmt(i):
+        if i < n_e:
+            return f"E{i} · {edges[i]['length']:.0f} mm{' arc' if edges[i]['curved'] else ''}"
+        return f"H{i - n_e} · hole Ø{2 * geom['circles'][i - n_e][1]:.1f}"
+    st.write("Click edges (E…) and holes (H…) on the drawing to build a selection, then apply a support, "
+             "fixture or force to all of it at once.")
+    selection = st.multiselect("Selection", opts, format_func=_fmt, key="sel_ms", placeholder="Nothing selected")
+    sel_e = [i for i in selection if i < n_e]
+    sel_h = [i - n_e for i in selection if i >= n_e]
+
+    if selection:
+        c1, c2, c3 = st.columns(3)
+        if c1.button("Fix selected", width="stretch",
+                     help="Edges become clamped supports; holes become fixed (bolted / press-fit)."):
+            ss.supports |= set(sel_e)
+            for j in sel_h:
+                ss.hole_fix[j] = {"type": "fixed"}
             ss.results = None
             st.rerun()
-    bc_rows = ([{"edge": f"E{i}", "condition": "fixed support", "Fx (N)": "", "Fy (N)": ""} for i in sorted(ss.supports)]
-               + [{"edge": f"E{i}", "condition": "force", "Fx (N)": f"{fx:g}", "Fy (N)": f"{fy:g}"}
-                  for i, (fx, fy) in sorted(ss.loads.items())])
-    if bc_rows:
-        st.dataframe(pd.DataFrame(bc_rows), hide_index=True, width="stretch")
+        if c2.button("Clear selected", width="stretch",
+                     help="Remove supports, hole fixtures and forces from the selected items."):
+            ss.supports -= set(sel_e)
+            for j in sel_h:
+                ss.hole_fix.pop(j, None)
+            for f in ss.forces:
+                f["targets"] = [t for t in f["targets"] if t not in selection]
+            ss.forces = [f for f in ss.forces if f["targets"]]
+            ss.results = None
+            st.rerun()
+        if c3.button("Deselect all", width="stretch"):
+            ss.pending_toggle = "clear"
+            st.rerun()
+
+        with st.form("force_form", border=True):
+            what = ("edges" if not sel_h else "holes (bolt bearing)" if not sel_e else "edges + holes")
+            st.write(f"Force on the selection: {', '.join(lab(i) for i in selection)}  ·  {what}")
+            f1, f2 = st.columns(2)
+            fx = f1.number_input("Fx (N)", value=0.0, format="%g")
+            fy = f2.number_input("Fy (N)", value=-1000.0, format="%g")
+            mode = st.radio("How", ["split", "each"], horizontal=True,
+                            format_func={"split": "Total, split across selection",
+                                         "each": "Same force on each item"}.get)
+            st.caption("Split: edges share it by length (uniform pressure), holes share it equally (bolt group). "
+                       "Add several forces to the same holes to load a bolt in several directions.")
+            if st.form_submit_button("Add force", width="stretch"):
+                if fx == 0 and fy == 0:
+                    st.warning("Force is zero.")
+                else:
+                    ss.force_count += 1
+                    ss.forces.append({"name": f"F{ss.force_count}", "targets": list(selection),
+                                      "F": (float(fx), float(fy)), "mode": mode})
+                    ss.supports -= set(sel_e)
+                    for j in sel_h:
+                        ss.hole_fix.pop(j, None)
+                    ss.results = None
+                    st.rerun()
+
+        if sel_h:
+            with st.form("pin_form", border=True):
+                st.write(f"Pin support on {', '.join(f'H{j}' for j in sel_h)} (frictionless pin, 180° contact)")
+                ang = st.number_input("Contact side (deg)  0 = right · 90 = top · 180 = left · 270 = bottom",
+                                      value=90.0, step=15.0, format="%g",
+                                      help="The side of the hole that presses on the pin. A part hanging from a "
+                                           "pin rests on the TOP of the hole (90).")
+                if st.form_submit_button("Apply pin support", width="stretch"):
+                    for j in sel_h:
+                        ss.hole_fix[j] = {"type": "pin", "angle": float(ang)}
+                    ss.results = None
+                    st.rerun()
+
+    # ---- summary of everything applied
+    rows = [{"what": "support", "on": ", ".join(f"E{i}" for i in sorted(ss.supports)), "detail": "clamped edges"}] \
+        if ss.supports else []
+    for j, b in sorted(ss.hole_fix.items()):
+        rows.append({"what": "fixed hole" if b["type"] == "fixed" else "pin", "on": f"H{j}",
+                     "detail": "" if b["type"] == "fixed" else f"contact side {b['angle']:g}°"})
+    for f in ss.forces:
+        rows.append({"what": f["name"], "on": ", ".join(lab(t) for t in f["targets"]),
+                     "detail": f"Fx {f['F'][0]:g} · Fy {f['F'][1]:g} N · {'split' if f['mode'] == 'split' else 'each'}"})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        if ss.forces:
+            d1, d2 = st.columns([2, 1])
+            gone = d1.selectbox("Delete a force", [f["name"] for f in ss.forces], label_visibility="collapsed")
+            if d2.button("Delete force", width="stretch"):
+                ss.forces = [f for f in ss.forces if f["name"] != gone]
+                ss.results = None
+                st.rerun()
+        hf = hole_forces_from(ss.forces, n_e)
+        clash = [j for j in hf if j in ss.hole_fix]
+        if clash:
+            st.markdown(f'<div class="note">NOTE → {", ".join(f"H{j}" for j in clash)}: hole is fixed / pinned, '
+                        'so bearing forces on it are ignored</div>', unsafe_allow_html=True)
     else:
         st.caption("No supports or forces yet.")
 
+loads = edge_loads_from(ss.forces, edges)
+hole_bc = hole_bc_full(ss.hole_fix, hole_forces_from(ss.forces, len(edges)))
+
 with col_plot:
     st.markdown(f'<p class="eyebrow">Part → {name}</p>', unsafe_allow_html=True)
-    fig = geometry_figure(geom, edges, ss.supports, ss.loads, ss.picked)
-    fig_key = f"geom_{len(ss.supports)}_{len(ss.loads)}_{ss.picked}"
+    fig = geometry_figure(geom, edges, ss.supports, loads, ss.sel_ms, hole_bc)
+    fig_key = "geom_" + hashlib.md5(str((sorted(ss.supports), ss.forces, sorted(ss.hole_fix.items()),
+                                          ss.sel_ms)).encode()).hexdigest()[:10]
     ev = st.plotly_chart(fig, width="stretch", on_select="rerun", selection_mode="points",
                          key=fig_key,
                          config={"displaylogo": False, "scrollZoom": True})
@@ -373,25 +691,29 @@ with col_plot:
         if isinstance(cd, list):
             cd = cd[0]
         if cd is None:
-            mids = np.array([e["mid"] for e in edges])
+            mids = np.array([e["mid"] for e in edges] + [np.asarray(c, float) for c, _ in geom["circles"]])
             cd = int(np.argmin(np.hypot(mids[:, 0] - p["x"], mids[:, 1] - p["y"])))
-        if int(cd) != ss.picked and ss.get("last_click") != (int(cd), p.get("x"), p.get("y"), fig_key):
-            ss.last_click = (int(cd), p.get("x"), p.get("y"), fig_key)
-            ss.pending_pick = int(cd)
+        if ss.get("last_click") != (int(cd), fig_key):
+            ss.last_click = (int(cd), fig_key)
+            ss.pending_toggle = int(cd)
             st.rerun()
     holes = len(geom["circles"]) + len(geom["poly_holes"])
-    st.caption(f"{len(edges)} edges · {holes} hole(s) · solid white = support · dotted = force · yellow = selected")
+    st.caption(f"{len(edges)} edges · {holes} hole(s) · solid white = support / fixture · dotted = force · yellow = selected")
 
 # ------------------------------------------------------------------ run
 st.divider()
 st.subheader("04 · Run")
-ready = bool(ss.supports) and bool(ss.loads)
-if not ready:
-    st.markdown('<p class="eyebrow">→ Add at least one fixed edge and one force to run</p>', unsafe_allow_html=True)
+has_load = bool(loads) or any(b["type"] == "bearing" and any(b["F"]) for b in hole_bc.values())
+problem = support_problem(ss.supports, ss.hole_fix)
+ready = has_load and problem is None
+if problem:
+    st.markdown(f'<p class="eyebrow">→ {problem}</p>', unsafe_allow_html=True)
+if not has_load:
+    st.markdown('<p class="eyebrow">→ Add a force on an edge, or a bearing load on a hole</p>', unsafe_allow_html=True)
 run = st.button("Run analysis", type="primary", disabled=not ready)
 
 if run:
-    part = build_part(geom, edges, ss.supports, ss.loads, thickness, E, nu, rho)
+    part = build_part(geom, edges, ss.supports, loads, thickness, E, nu, rho, hole_bc)
     with st.spinner("Meshing and solving at two mesh sizes…"):
         try:
             sols = solve_two_meshes(part)
@@ -399,12 +721,17 @@ if run:
             st.error(f"Solve failed: {e}")
             st.stop()
     ss.results = {"part": part, "sols": sols}
+    ss.probes = []
+    ss.run_id = ss.get("run_id", 0) + 1
 
 if ss.results:
     part, sols = ss.results["part"], ss.results["sols"]
     part["corner_radius"] = rho
     model = load_model()
     flags = analyse(part, sols, model)
+    hole_rows, hole_summary = scan_holes(part, sols)
+    if hole_rows:
+        flags = pd.concat([flags, pd.DataFrame(hole_rows)], ignore_index=True)
     regular = max_regular_stress(part, sols, flags)
     sharp = flags[(flags.type == "sharp re-entrant corner")]
     artef = flags[(flags.type == "support / load artefact")]
@@ -419,12 +746,110 @@ if ss.results:
 
     left, right = st.columns([3, 2], gap="large")
     with left:
-        st.pyplot(result_figure(part, sols, flags, regular), width="stretch")
+        tab_s, tab_c, tab_m = st.tabs(["Stress map", "Contours + probe", "Mesh"])
+        with tab_c:
+            mfine = sols["fine"]["m"]
+            fields = field_values(sols["fine"]["s"], part.get("E", 210000.0), part.get("nu", 0.3))
+            k1, k2 = st.columns([3, 2])
+            fkey = k1.selectbox("Field", list(FIELDS), format_func=lambda k: FIELDS[k][0], key="ct_field")
+            cmap = k2.selectbox("Colours", list(CMAPS), key="ct_cmap")
+            vals = fields[fkey]
+            unit = FIELDS[fkey][1]
+            near = singular_mask(mfine.p.T, flags)
+            k3, k4 = st.columns([3, 2])
+            rmode = k3.radio("Range", ["auto", "full", "manual"], horizontal=True, key="ct_range",
+                             format_func={"auto": "Auto (ignore singular spikes)", "full": "Auto (full)",
+                                          "manual": "Manual"}.get)
+            levels = k4.slider("Bands", 4, 30, 12, key="ct_levels")
+            v_ok = vals[~near] if (~near).any() else vals
+            if rmode == "auto":
+                lo, hi = float(v_ok.min()), float(v_ok.max())
+            else:
+                lo, hi = float(vals.min()), float(vals.max())
+            if rmode == "manual":
+                k5, k6 = st.columns(2)
+                lo = k5.number_input(f"Min ({unit})", value=float(f"{lo:.4g}"), format="%g", key=f"ct_lo_{fkey}")
+                hi = k6.number_input(f"Max ({unit})", value=float(f"{hi:.4g}"), format="%g", key=f"ct_hi_{fkey}")
+            if hi <= lo:
+                hi = lo + max(abs(lo), 1.0) * 1e-3
+            excl = st.checkbox("Max / min markers: exclude flagged singular points", value=True, key="ct_excl",
+                               help="At a sharp corner or clamp end the raw FE value is set by the mesh, "
+                                    "not the physics. Excluding them shows the real extremes.")
+            pool = ~near if (excl and (~near).any()) else np.ones(len(vals), bool)
+            imax = np.flatnonzero(pool)[np.argmax(vals[pool])]
+            imin = np.flatnonzero(pool)[np.argmin(vals[pool])]
+            extremes = {"MAX": (mfine.p[0, imax], mfine.p[1, imax], vals[imax]),
+                        "MIN": (mfine.p[0, imin], mfine.p[1, imin], vals[imin])}
+            gx, gy, Z = contour_grid(mfine.p[0], mfine.p[1], mfine.t.T, vals)
+            ss.setdefault("probes", [])
+            probes = probe_values(mfine, fields, ss.probes)
+            cfig = contour_figure(gx, gy, Z, lo, hi, levels, cmap, unit, probes, extremes)
+            ckey = f"ct_{fkey}_{len(ss.probes)}_{ss.get('run_id', 0)}"
+            cev = st.plotly_chart(cfig, width="stretch", on_select="rerun", selection_mode="points", key=ckey,
+                                  config={"displaylogo": False, "scrollZoom": True})
+            try:
+                cpts = cev.selection.points if cev else []
+            except AttributeError:
+                cpts = (cev or {}).get("selection", {}).get("points", [])
+            if cpts:
+                px_, py_ = float(cpts[0]["x"]), float(cpts[0]["y"])
+                if ss.get("last_probe") != (px_, py_, ckey):
+                    ss.last_probe = (px_, py_, ckey)
+                    ss.probes.append((px_, py_))
+                    st.rerun()
+            st.caption("Hover for a live reading · click to pin a probe (P1, P2, …) · scroll to zoom, drag to pan. "
+                       f"▲ MAX {vals[imax]:.4g} {unit} at ({mfine.p[0, imax]:.1f}, {mfine.p[1, imax]:.1f}) · "
+                       f"▼ MIN {vals[imin]:.4g} {unit} at ({mfine.p[0, imin]:.1f}, {mfine.p[1, imin]:.1f})")
+            if probes:
+                pt = pd.DataFrame(probes)
+                show = pd.DataFrame({"probe": [f"P{i + 1}" for i in range(len(pt))],
+                                     "x, y (mm)": [f"{a:.2f}, {b:.2f}" for a, b in zip(pt.x, pt.y)],
+                                     "von Mises": pt.vm.round(1), "σ1": pt.s1.round(1), "σ2": pt.s2.round(1),
+                                     "τmax": pt.tmax.round(1), "ε1 (µε)": pt.e1.round(0)})
+                st.dataframe(show, hide_index=True, width="stretch")
+                warn = [f"P{i + 1}" for i, (x, y) in enumerate(ss.probes)
+                        if singular_mask(np.array([[x, y]]), flags, 0.15)[0]]
+                if warn:
+                    st.markdown(f'<div class="note">NOTE → {", ".join(warn)}: next to a flagged singular point, '
+                                'so the FE value there depends on the mesh. Use the predicted real stress instead.'
+                                '</div>', unsafe_allow_html=True)
+                if st.button("Clear probes", key="clear_probes"):
+                    ss.probes = []
+                    st.rerun()
+        with tab_s:
+            st.pyplot(result_figure(part, sols, flags, regular, hole_summary), width="stretch")
+        with tab_m:
+            mc1, mc2 = st.columns(2)
+            which = mc1.radio("Mesh", ["fine", "coarse"], horizontal=True, key="mesh_which",
+                              format_func={"fine": "Fine (results)", "coarse": "Coarse (check)"}.get)
+            targets = {"Whole part": None}
+            for _, r in flags[flags.singular].iterrows():
+                targets[f"{r.label} · {r.type.split(' (')[0]}"] = (r.x, r.y, max(0.35 * r.ell, 1e-3))
+            for h in hole_summary:
+                c, rr = part["circles"][int(h["hole"][1:])]
+                targets[f"{h['hole']} · hole"] = (c[0], c[1], 2.2 * rr)
+            zoom = mc2.selectbox("Zoom to", list(targets), key="mesh_zoom")
+            m_ = sols[which]["m"]
+            tg = targets[zoom]
+            st.pyplot(mesh_figure(m_, flags, hole_summary,
+                                  None if tg is None else tg[:2], None if tg is None else tg[2],
+                                  title=f"{which.upper()} MESH · {zoom.upper()}"), width="stretch")
+            ms_c, ms_f = mesh_stats(sols["coarse"]["m"]), mesh_stats(sols["fine"]["m"])
+            st.dataframe(pd.DataFrame({
+                "": ["nodes", "elements", "degrees of freedom", "smallest element (mm)", "largest element (mm)"],
+                "coarse": [f"{ms_c['nodes']:,}", f"{ms_c['elements']:,}", f"{ms_c['dof']:,}",
+                           f"{ms_c['h_min']:.3f}", f"{ms_c['h_max']:.2f}"],
+                "fine": [f"{ms_f['nodes']:,}", f"{ms_f['elements']:,}", f"{ms_f['dof']:,}",
+                         f"{ms_f['h_min']:.3f}", f"{ms_f['h_max']:.2f}"]}),
+                hide_index=True, width="stretch")
+            st.caption("6-node quadratic triangles (like ANSYS PLANE183); drawn as their corner triangles. "
+                       "The fine mesh halves the element size at every corner, support end and hole; "
+                       "singular points are those whose stress keeps rising between the two.")
     with right:
         st.markdown("### Sharp corners → real stress")
         if len(sharp):
             t = pd.DataFrame({
-                "point": [f"V{int(v)}" for v in sharp.vertex],
+                "point": list(sharp.label),
                 "real stress (MPa)": sharp.get("predicted_real_stress", pd.Series(np.nan, index=sharp.index)).round(0),
                 "radius": sharp.corner_radius,
                 "angle": sharp.angle_deg.round(0),
@@ -436,19 +861,31 @@ if ss.results:
                        "corner radius set in the sidebar (change it and the table updates without re-solving).")
             for _, r in sharp.iterrows():
                 if isinstance(r.get("note"), str) and r.note:
-                    st.markdown(f'<div class="note">NOTE → V{int(r.vertex)}: {r.note}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="note">NOTE → {r.label}: {r.note}</div>', unsafe_allow_html=True)
         else:
             st.write("No sharp re-entrant corners with singular stress.")
         if len(artef):
             st.markdown("### Support / load artefacts")
-            st.dataframe(pd.DataFrame({"point": [f"V{int(v)}" for v in artef.vertex],
+            st.dataframe(pd.DataFrame({"point": list(artef.label),
                                        "FE fine (MPa)": artef.fe_stress_fine.round(0),
                                        "rise on refining": [f"×{x:.2f}" for x in artef.refine_ratio]}),
                          hide_index=True, width="stretch")
-            st.caption("These come from idealised boundary conditions (perfectly rigid clamp, load on an edge "
-                       "end). They are not physical. Read stresses away from them, or model the real support.")
+            st.caption("These come from idealised boundary conditions: a perfectly rigid clamp, a load that "
+                       "starts abruptly, or the sharp edge of an idealised pin contact (H…@ angle). They are not "
+                       "physical stresses. Read stresses away from them, or model the real support / contact.")
+        if hole_summary:
+            st.markdown("### Holes → peak stress")
+            hs = pd.DataFrame(hole_summary)
+            st.dataframe(pd.DataFrame({
+                "hole": hs.hole, "fixture": hs.fixture, "Ø": (2 * hs.radius_mm).round(1),
+                "peak (MPa)": hs.peak_stress.round(0), "at °": hs.at_angle_deg.round(0),
+                "Δ coarse": [f"{x:+.1f}%" for x in hs.change_pct],
+                "sing.": hs.singular_points}), hide_index=True, width="stretch")
+            st.caption("Highest stress on each hole edge away from flagged points. A small change vs the coarse "
+                       "mesh means it is converged and real (this is the hole's stress concentration).")
 
-    rep = report_text(name, {"t": thickness, "E": E, "nu": nu}, sorted(ss.supports), ss.loads, edges, flags, regular)
+    rep = report_text(name, {"t": thickness, "E": E, "nu": nu}, sorted(ss.supports), loads, edges, flags, regular,
+                      hole_bc, hole_summary, ss.forces)
     d1, d2 = st.columns(2)
     d1.download_button("Download report (Markdown)", rep, file_name=f"{Path(name).stem}_singularity_report.md")
     d2.download_button("Download results (CSV)", flags.to_csv(index=False),
@@ -464,7 +901,11 @@ with st.expander("How it works"):
         "3. **Classify.** Sharp re-entrant corners (angle > 190°) are geometric singularities. Ends of fixed or "
         "loaded edges are boundary-condition artefacts.\n"
         "4. **Predict.** The stresses at 0.1–0.3 l from each sharp corner converge on any reasonable mesh. "
-        "A model trained on ~49,000 sharp-vs-filleted FE pairs maps them, plus the real corner radius, to the "
+        "A model trained on ~74,000 sharp-vs-filleted FE pairs maps them, plus the real corner radius, to the "
         "finite peak stress.\n\n"
-        "**Limits:** 2D plane stress, linear elastic, fixed (clamped) supports, forces on edges. Corner angles "
-        "190–330°, corner radius 1–30% of the local feature size.")
+        "5. **Holes.** Each circular hole can be fixed (bolted), rest on a frictionless pin (radial contact on "
+        "one half), or carry a bolt bearing load (cosine pressure on the loaded half). The hole edge is scanned "
+        "at both meshes: points that keep rising (e.g. edges of a pin contact patch) are flagged; the converged "
+        "hole peak is reported.\n\n"
+        "**Limits:** 2D plane stress, linear elastic. Pin contact is modelled as bonded-radial on a fixed 180° "
+        "patch (no gap/friction). Corner angles 190–330°, corner radius 1–100% of the local feature size (best below 30%).")

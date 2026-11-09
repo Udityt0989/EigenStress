@@ -9,9 +9,13 @@ Double-click `run_app.bat`. Leave it running and edit the code in VS Code. **Eve
 | Layout, text, buttons, tables, colours of the UI | `app.py` | Sections are marked `# ---- sidebar`, `# ---- geometry`, `# ---- run`. Theme colours are in `.streamlit/config.toml` and at the top of `app.py`. |
 | The interactive drawing (edge labels, arrows, click behaviour) | `app.py` → `geometry_figure()` | Plotly figure. |
 | The results stress map | `app.py` → `result_figure()` | Matplotlib figure. |
+| Contours, probe, max/min | `app.py` → `FIELDS`, `field_values()`, `contour_grid()`, `contour_figure()`, `probe_values()` | Plotly contour + invisible click layer for probes. Add a field by adding it to `FIELDS` and `field_values()`. |
+| Mesh view | `app.py` → `mesh_figure()`, `mesh_stats()` | |
 | The downloadable report | `app.py` → `report_text()` | Markdown text. |
 | Which file types can be uploaded / how DXF is read | `geometry_io.py` | `read_dxf()` returns `outline`, `circles`, `poly_holes`. |
-| Support types, loads, material model | `fe2d.py` → `solve_plane_stress()`, then `app.py` → `build_part()` and the UI | E.g. a roller support = clamp only one displacement component. |
+| Support types, loads, material model | `fe2d.py` → `solve_plane_stress()` (`fixed_arcs`, `radial_arcs`, `bearing_arcs` for holes), then `app.py` → `build_part()` and the UI | E.g. a roller support = clamp only one displacement component. |
+| Force groups / multi-select | `app.py` → `edge_loads_from()`, `hole_forces_from()`, `hole_bc_full()` and the `03 · Supports + forces` block | Forces are stored as groups in `st.session_state.forces`. |
+| Hole singularity scan | `sing_tool.py` → `scan_holes()` | Compares coarse vs fine stress around each hole. |
 | How singular points are flagged / classified | `sing_tool.py` → `analyse()` | Threshold `RATIO_THRESHOLD`, angle `CANDIDATE_ANGLE`. |
 | What the model sees at a corner | `corner_tools.py` → `corner_features()` | **Changing this needs regenerating data and retraining** (see README). |
 | The ML model | `train_model.py` → produces `singularity_model.joblib` | |

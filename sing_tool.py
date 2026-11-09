@@ -58,6 +58,13 @@ def bc_vertices(part):
     return {i for i, P in enumerate(poly) if any(np.linalg.norm(P - q) < 1e-6 for q in ends)}
 
 
+def fixed_vertices(part):
+    """Vertices touching a clamped edge (there the corner field is changed by the clamp itself)."""
+    poly = part["poly"]
+    ends = [np.array(p, float) for e in part.get("fixed", []) for p in e]
+    return {i for i, P in enumerate(poly) if any(np.linalg.norm(P - q) < 1e-6 for q in ends)}
+
+
 def ansys_sampler(csv_path, poly):
     """Build a field sampler from an ANSYS nodal export (x, y, SX, SY, SXY, SEQV)."""
     from scipy.spatial import Delaunay
@@ -81,6 +88,36 @@ def part_holes(part):
             [[tuple(p) for p in h] for h in part.get("poly_holes", [])])
 
 
+HOLE_DIVS = {"coarse": 48, "fine": 96}   # elements around each hole circumference
+
+
+def hole_fixture_arcs(part):
+    """
+    part["hole_bc"] = {hole_index: {"type": "fixed" | "pin" | "bearing",
+                                    "angle": contact-centre angle in deg (pin),
+                                    "F": (Fx, Fy) bearing force per unit thickness, N/mm}}
+    Returns solver arc lists + the angles where each fixture starts/ends (mesh nodes are placed there).
+    """
+    circles = part.get("circles", [])
+    fixed, radial, bearing, splits = [], [], [], {j: [] for j in range(len(circles))}
+    for j, bc in part.get("hole_bc", {}).items():
+        j = int(j)
+        c, r = tuple(circles[j][0]), circles[j][1]
+        if bc["type"] == "fixed":
+            fixed.append((c, r, 0.0, 360.0))
+        elif bc["type"] == "pin":
+            a = bc.get("angle", 90.0)
+            radial.append((c, r, a - 90.0, a + 90.0))
+            splits[j] += [a - 90.0, a + 90.0]
+        elif bc["type"] == "bearing":
+            Fx, Fy = bc["F"]
+            if Fx or Fy:
+                th = np.degrees(np.arctan2(Fy, Fx))
+                bearing.append((c, r, (Fx, Fy)))
+                splits[j] += [th - 90.0, th + 90.0]
+    return fixed, radial, bearing, splits
+
+
 def refine_vertices(part):
     beta = interior_angles(part["poly"])
     return sorted({i for i, b in enumerate(beta) if b > CANDIDATE_ANGLE} | bc_vertices(part))
@@ -97,12 +134,15 @@ def solve_two_meshes(part, h_fine_div=40, h_coarse_div=20):
     if verts:
         hg = min(hg, min(ells[i] for i in verts) / 2)
     res = {}
+    fixed_arcs, radial_arcs, bearing_arcs, splits = hole_fixture_arcs(part)
     for tag, div in (("coarse", h_coarse_div), ("fine", h_fine_div)):
         hs = {i: ells[i] / div for i in verts}
-        m = mesh_polygon(poly, refine=list(hs.items()), h_global=hg, circles=circles, poly_holes=poly_holes)
+        circ = [(c, r, splits.get(j, []), 2 * np.pi * r / HOLE_DIVS[tag]) for j, (c, r) in enumerate(circles)]
+        m = mesh_polygon(poly, refine=list(hs.items()), h_global=hg, circles=circ, poly_holes=poly_holes)
         s = solve_plane_stress(m, [tuple(map(tuple, e)) for e in part.get("fixed", [])],
                                [(e[0], e[1], tuple(e[2])) for e in part.get("traction", [])],
-                               E=part.get("E", 210000.0), nu=part.get("nu", 0.3))
+                               E=part.get("E", 210000.0), nu=part.get("nu", 0.3),
+                               fixed_arcs=fixed_arcs, radial_arcs=radial_arcs, bearing_arcs=bearing_arcs)
         res[tag] = {"m": m, "s": s, "h": hs, "ell": ells, "sampler": sampler_from_mesh(m, s),
                     "xy": m.p.T, "vm": s["vm"]}
     return res
@@ -116,6 +156,7 @@ def analyse(part, sols, model=None):
     poly = part["poly"]
     beta = interior_angles(poly)
     bcv = bc_vertices(part)
+    fixv = fixed_vertices(part)
     circles, poly_holes = part_holes(part)
     rad_default = part.get("corner_radius", 0.5)
     rad_by = {int(k): v for k, v in part.get("corner_radius_by_vertex", {}).items()}
@@ -130,12 +171,12 @@ def analyse(part, sols, model=None):
         ell = f.get("ell", {}).get(i) if isinstance(f.get("ell"), dict) else None
         if ell is None:
             ell = corner_length(poly, i, circles, poly_holes)
-        row = {"vertex": i, "x": P[0], "y": P[1], "angle_deg": round(beta[i], 1),
+        row = {"vertex": i, "label": f"V{i}", "x": P[0], "y": P[1], "angle_deg": round(beta[i], 1),
                "fe_stress_coarse": v_c, "fe_stress_fine": v_f, "refine_ratio": ratio,
                "singular": bool(rising), "ell": ell}
         if not rising:
             row["type"] = "regular"
-        elif beta[i] > CANDIDATE_ANGLE and i not in bcv:
+        elif beta[i] > CANDIDATE_ANGLE and i not in fixv:
             row["type"] = "sharp re-entrant corner"
             row["williams_lambda"] = williams_lambda(beta[i])
             rho = rad_by.get(i, rad_default)
@@ -145,8 +186,11 @@ def analyse(part, sols, model=None):
             notes = []
             if not (MODEL_BETA_RANGE[0] <= beta[i] <= MODEL_BETA_RANGE[1]):
                 notes.append("corner angle outside trained range (190-330 deg)")
-            if not (0.01 <= rho / ell <= 0.3):
-                notes.append(f"radius/l = {rho / ell:.3f} outside trained range 0.01-0.3")
+            if not (0.01 <= rho / ell <= 1.0):
+                notes.append(f"radius/l = {rho / ell:.3f} outside trained range 0.01-1.0")
+            if i in bcv:
+                notes.append("a load is applied on an edge touching this corner; the prediction assumes the "
+                             "corner field is dominated by the geometry, so treat it as approximate")
             if feats is None:
                 notes.append(f"mesh too coarse at corner (need h <= {MAX_H_OVER_ELL:.2f}*l)")
             elif model is not None:
@@ -159,6 +203,66 @@ def analyse(part, sols, model=None):
                            "read stress away from it or model the real support")
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def hole_profile(sol, c, r):
+    """Nodal von Mises stress around a hole: (angles in deg, stress), sorted by angle."""
+    xy, vm = sol["xy"], sol["vm"]
+    d = np.hypot(xy[:, 0] - c[0], xy[:, 1] - c[1])
+    on = np.abs(d - r) < 1e-6 * r + 1e-9
+    ang = np.degrees(np.arctan2(xy[on, 1] - c[1], xy[on, 0] - c[0])) % 360
+    o = np.argsort(ang)
+    return ang[o], vm[on][o]
+
+
+def scan_holes(part, sols):
+    """
+    Singularity check around every circular hole.
+    * At each place a fixture starts/ends (e.g. edges of a pin contact patch) compare the stress at that
+      exact point on the coarse and fine mesh: still rising => singular (boundary-condition artefact).
+    * Everywhere else, report the converged peak stress on the hole edge.
+    Returns (rows for singular points, per-hole summary list).
+    """
+    circles = part.get("circles", [])
+    _, _, _, splits = hole_fixture_arcs(part)
+    kinds = {int(j): bc["type"] for j, bc in part.get("hole_bc", {}).items()}
+    rows, summary = [], []
+    for j, (c, r) in enumerate(circles):
+        c = np.asarray(c, float)
+        a_c, v_c = hole_profile(sols["coarse"], c, r)
+        a_f, v_f = hole_profile(sols["fine"], c, r)
+        if len(a_f) < 8 or len(a_c) < 8:
+            continue
+        coarse_at = lambda a: float(np.interp(a % 360, a_c, v_c, period=360))
+        flagged = []
+        for a in sorted({round(x % 360, 6) for x in splits.get(j, [])}):
+            k = int(np.argmin(np.abs((a_f - a + 180) % 360 - 180)))
+            vf, vc = float(v_f[k]), coarse_at(a)
+            ratio = vf / max(vc, 1e-9)
+            if ratio > RATIO_THRESHOLD and vf > 1e-3 * np.abs(sols["fine"]["vm"]).max():
+                flagged.append(a)
+                P = c + r * np.array([np.cos(np.radians(a)), np.sin(np.radians(a))])
+                rows.append({"vertex": np.nan, "label": f"H{j} @ {a:.0f}°", "x": P[0], "y": P[1],
+                             "angle_deg": np.nan, "fe_stress_coarse": vc, "fe_stress_fine": vf,
+                             "refine_ratio": ratio, "singular": True, "ell": r,
+                             "type": "support / load artefact",
+                             "note": f"edge of the {kinds.get(j, 'fixture')} contact on hole H{j}: an idealised "
+                                     "contact patch with a sharp end. Real contact pressure fades out smoothly; "
+                                     "model contact (nonlinear) to resolve it"})
+        # converged peak on the hole edge, away from flagged points
+        far = np.ones(len(a_f), bool)
+        for a in flagged:
+            far &= np.abs((a_f - a + 180) % 360 - 180) > 12
+        if far.any():
+            k = int(np.argmax(np.where(far, v_f, -np.inf)))
+            pk, ang = float(v_f[k]), float(a_f[k])
+            pc = coarse_at(ang)
+            summary.append({"hole": f"H{j}", "fixture": kinds.get(j, "free"), "radius_mm": r,
+                            "peak_stress": pk, "at_angle_deg": ang, "coarse_mesh": pc,
+                            "change_pct": 100 * (pk - pc) / max(pc, 1e-9),
+                            "x": c[0] + r * np.cos(np.radians(ang)), "y": c[1] + r * np.sin(np.radians(ang)),
+                            "singular_points": len(flagged)})
+    return rows, summary
 
 
 def max_regular_stress(part, sols, flags):

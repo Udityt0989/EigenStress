@@ -48,7 +48,8 @@ def summary(name, e):
 
 def main():
     parts = []
-    for f in ("dataset.csv", "dataset_notch.csv", "dataset_bracket2.csv"):
+    for f in ("dataset.csv", "dataset_notch.csv", "dataset_bracket2.csv",
+              "dataset_stepped.csv", "dataset_bracket_bigr.csv", "dataset_notch_bigr.csv"):
         try:
             d = pd.read_csv(f)
         except FileNotFoundError:
@@ -70,7 +71,7 @@ def main():
     pred_phys = np.exp(phys.predict(Xpt) + offt)
 
     # ML
-    est = HistGradientBoostingRegressor(max_iter=800, learning_rate=0.05, max_leaf_nodes=31,
+    est = HistGradientBoostingRegressor(max_iter=2000, learning_rate=0.05, max_leaf_nodes=63,
                                         min_samples_leaf=20, l2_regularization=1e-3, random_state=0)
     est.fit(dtr[FEATURES], dtr["y"])
     pred_ml = np.exp(est.predict(dte[FEATURES])) * dte["s_ref"].abs()
@@ -88,6 +89,9 @@ def main():
     out = dte[["seed", "family", "beta", "h_over_ell", "rho_over_ell", "vm_corner_node", "target_peak"]].copy()
     out["pred_phys"], out["pred_ml"] = pred_phys, pred_ml
     out.to_csv("test_predictions.csv", index=False)
+    rr = out.assign(e=np.abs(pct_err(out.pred_ml, out.target_peak)),
+                    band=pd.cut(out.rho_over_ell, [0, 0.1, 0.3, 0.6, 1.01]))
+    print("\nmean |ML error| % by radius / l:\n", rr.groupby("band", observed=True).e.agg(["mean", "count"]).round(2))
     by_mesh = out.assign(err_ml=np.abs(pct_err(out.pred_ml, out.target_peak)),
                          err_naive=np.abs(pct_err(out.vm_corner_node, out.target_peak))) \
         .groupby(out.h_over_ell.round(4))[["err_naive", "err_ml"]].mean()

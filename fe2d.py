@@ -54,7 +54,8 @@ def mesh_polygon(poly, fillets=None, refine=None, h_global=5.0, verbose=False, c
     poly       : CCW list of vertices
     fillets    : {vertex_index: radius}
     refine     : list of (vertex_index, h_local) - graded refinement at that vertex (or its fillet arc)
-    circles    : list of ((cx, cy), r) circular holes
+    circles    : list of ((cx, cy), r) or ((cx, cy), r, split_angles_deg, h_hole) circular holes.
+                 split_angles put mesh nodes exactly where a hole fixture starts/ends.
     poly_holes : list of polygonal holes (lists of vertices)
     Returns skfem MeshTri.
     """
@@ -99,12 +100,16 @@ def mesh_polygon(poly, fillets=None, refine=None, h_global=5.0, verbose=False, c
     curves.append(geo.addLine(prev_pt, first_pt))
     loops = [geo.addCurveLoop(curves)]
     hole_curves = []
-    for (cx, cy), r in circles:
+    for circ in circles:
+        (cx, cy), r = circ[0], circ[1]
+        splits = circ[2] if len(circ) > 2 and circ[2] is not None else []
+        h_hole = circ[3] if len(circ) > 3 and circ[3] is not None else 2 * np.pi * r / 32
+        angs = sorted({round(a % 360.0, 9) for a in [0.0, 90.0, 180.0, 270.0] + list(splits)})
         pc = geo.addPoint(cx, cy, 0)
-        q = [geo.addPoint(cx + r * np.cos(t), cy + r * np.sin(t), 0) for t in np.arange(4) * np.pi / 2]
-        arcs = [geo.addCircleArc(q[k], pc, q[(k + 1) % 4]) for k in range(4)]
+        q = [geo.addPoint(cx + r * np.cos(np.radians(a)), cy + r * np.sin(np.radians(a)), 0) for a in angs]
+        arcs = [geo.addCircleArc(q[k], pc, q[(k + 1) % len(q)]) for k in range(len(q))]
         loops.append(geo.addCurveLoop(arcs))
-        hole_curves.append((arcs, min(h_global, 2 * np.pi * r / 32)))
+        hole_curves.append((arcs, min(h_global, h_hole)))
     for hole in poly_holes:
         pts = [add_pt(np.asarray(p, float)) for p in hole]
         lines = [geo.addLine(pts[k], pts[(k + 1) % len(pts)]) for k in range(len(pts))]
@@ -176,10 +181,29 @@ def _on_segment(x, p, q, tol):
     return (dist < tol) & (s > -tol) & (s < L + tol)
 
 
-def solve_plane_stress(m, fixed_edges, traction_edges, E=E_STEEL, nu=NU_STEEL):
+def _arc_facets(m, c, r, a0, a1):
+    """Boundary facets lying on the circle (c, r) between angles a0 -> a1 (deg, CCW)."""
+    c = np.asarray(c, float)
+    span = (a1 - a0) % 360.0 or 360.0
+
+    def on_arc(x):
+        d = np.hypot(x[0] - c[0], x[1] - c[1])
+        ang = np.degrees(np.arctan2(x[1] - c[1], x[0] - c[0]))
+        rel = (ang - a0) % 360.0
+        return (np.abs(d - r) < 0.02 * r) & (rel <= span + 1e-9)
+    f = m.facets_satisfying(on_arc)
+    return np.intersect1d(f, m.boundary_facets())
+
+
+def solve_plane_stress(m, fixed_edges, traction_edges, E=E_STEEL, nu=NU_STEEL,
+                       fixed_arcs=(), radial_arcs=(), bearing_arcs=()):
     """
     fixed_edges    : list of (p, q) segments, fully clamped
     traction_edges : list of (p, q, (tx, ty)) uniform traction in MPa (N/mm^2 per unit thickness)
+    fixed_arcs     : list of (c, r, a0, a1) hole arcs fully clamped (bolted / press-fit hole)
+    radial_arcs    : list of (c, r, a0, a1) hole arcs held only radially (frictionless pin contact)
+    bearing_arcs   : list of (c, r, (Fx, Fy)) bolt bearing load: force per unit thickness (N/mm),
+                     cosine pressure on the half of the hole the bolt pulls toward
     Returns dict of averaged nodal stresses (sx, sy, txy, vm) on mesh vertices.
     """
     e = ElementVector(ElementTriP2())
@@ -199,12 +223,55 @@ def solve_plane_stress(m, fixed_edges, traction_edges, E=E_STEEL, nu=NU_STEEL):
             return tx * v[0] + ty * v[1]
         f += asm(trac, fb)
 
+    # bolt bearing: p(theta) = p0 cos(theta - thetaF) on |theta - thetaF| < 90 deg, p0 = 2F / (pi r)
+    for c, r, (Fx, Fy) in bearing_arcs:
+        Fm = np.hypot(Fx, Fy)
+        if Fm == 0:
+            continue
+        thF = np.degrees(np.arctan2(Fy, Fx))
+        facets = _arc_facets(m, c, r, thF - 90, thF + 90)
+        fb = FacetBasis(m, e, facets=facets)
+        p0 = 2 * Fm / (np.pi * r)
+        cx, cy, ux, uy = c[0], c[1], Fx / Fm, Fy / Fm
+
+        @LinearForm
+        def bear(v, w, cx=cx, cy=cy, ux=ux, uy=uy, p0=p0):
+            dx, dy = w.x[0] - cx, w.x[1] - cy
+            d = np.sqrt(dx ** 2 + dy ** 2)
+            nx, ny = dx / d, dy / d                       # from hole centre into the material
+            pr = p0 * np.maximum(nx * ux + ny * uy, 0.0)
+            return pr * (nx * v[0] + ny * v[1])
+        f += asm(bear, fb)
+
     D = []
     for p, q in fixed_edges:
         facets = m.facets_satisfying(lambda x, p=p, q=q: _on_segment(x, p, q, tol))
         D.append(ib.get_dofs(facets=facets).all())
-    D = np.unique(np.concatenate(D))
-    u = solve(*condense(K, f, D=D))
+    for c, r, a0, a1 in fixed_arcs:
+        D.append(ib.get_dofs(facets=_arc_facets(m, c, r, a0, a1)).all())
+    D = np.unique(np.concatenate(D)) if D else np.array([], dtype=int)
+
+    # frictionless pin: stiff radial springs at every DOF location on the contact arc (penalty method)
+    if radial_arcs:
+        import scipy.sparse as sp
+        kpen = 1e4 * E
+        rows, cols, vals = [], [], []
+        for c, r, a0, a1 in radial_arcs:
+            dofs = ib.get_dofs(facets=_arc_facets(m, c, r, a0, a1))
+            ux_ = np.concatenate([dofs.nodal["u^1"], dofs.facet["u^1"]])
+            uy_ = np.concatenate([dofs.nodal["u^2"], dofs.facet["u^2"]])
+            loc = ib.doflocs[:, ux_]
+            n = loc - np.asarray(c, float)[:, None]
+            n /= np.linalg.norm(n, axis=0)
+            for a, b, w_ in ((ux_, ux_, n[0] * n[0]), (ux_, uy_, n[0] * n[1]),
+                             (uy_, ux_, n[1] * n[0]), (uy_, uy_, n[1] * n[1])):
+                rows.append(a); cols.append(b); vals.append(kpen * w_)
+        K = K + sp.coo_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+                              shape=K.shape).tocsr()
+    if len(D):
+        u = solve(*condense(K, f, D=D))
+    else:
+        u = solve(K, f)
 
     # exact strain at each element's 3 vertices (strain is linear in a P2 triangle)
     X = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
