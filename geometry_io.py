@@ -49,14 +49,28 @@ def _bulge_points(p0, p1, bulge):
 
 def read_dxf(path_or_stream, scale=1.0):
     import ezdxf
+    from ezdxf import recover
     if hasattr(path_or_stream, "read"):
-        import io
+        # write the upload to a temp file and let ezdxf detect encoding / line endings (\r\n from
+        # SolidWorks etc.) / binary DXF itself - reading a decoded string can silently lose every entity
+        import os
+        import tempfile
         data = path_or_stream.read()
-        if isinstance(data, bytes):
-            data = data.decode("utf-8", errors="ignore")
-        doc = ezdxf.read(io.StringIO(data))
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        fd, tmp = tempfile.mkstemp(suffix=".dxf")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        try:
+            path_or_stream = tmp
+            doc = _read_any(tmp)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     else:
-        doc = ezdxf.readfile(path_or_stream)
+        doc = _read_any(path_or_stream)
     msp = doc.modelspace()
 
     chains, circles = [], []                        # chains: list of point lists (open or closed)
@@ -97,12 +111,38 @@ def read_dxf(path_or_stream, scale=1.0):
     outer = loops[0]
     if _area(outer) < 0:
         outer = outer[::-1]
-    poly_holes = []
+    poly_holes, hole_circles = [], [(c, r) for c, r in circles if _inside(outer, c)]
     for l in loops[1:]:
         if _inside(outer, l[0]):
-            poly_holes.append(l[::-1] if _area(l) > 0 else l)   # holes clockwise
-    hole_circles = [(c, r) for c, r in circles if _inside(outer, c)]
+            circ = _as_circle(l)
+            if circ is not None:
+                hole_circles.append(circ)                        # round hole -> clickable H fixture
+            else:
+                poly_holes.append(l[::-1] if _area(l) > 0 else l)   # other cutouts (clockwise)
     return {"outline": outer, "circles": hole_circles, "poly_holes": poly_holes}
+
+
+def _read_any(path):
+    import ezdxf
+    from ezdxf import recover
+    try:
+        return ezdxf.readfile(path)
+    except Exception:
+        doc, _auditor = recover.readfile(path)      # tolerant reader for slightly broken exports
+        return doc
+
+
+def _as_circle(loop, rtol=2e-3):
+    """If a closed loop is a full circle (e.g. a hole drawn as two half-arcs), return ((cx, cy), r)."""
+    P = np.asarray(loop, float)
+    if len(P) < 12:
+        return None
+    c = P.mean(axis=0)
+    d = np.linalg.norm(P - c, axis=1)
+    r = d.mean()
+    if r > 0 and d.std() / r < rtol:
+        return (tuple(c), float(r))
+    return None
 
 
 def _join_chains(chains, tol=None):

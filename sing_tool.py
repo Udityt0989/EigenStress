@@ -123,6 +123,40 @@ def refine_vertices(part):
     return sorted({i for i, b in enumerate(beta) if b > CANDIDATE_ANGLE} | bc_vertices(part))
 
 
+def min_wall(part, n_pts=1500):
+    """Thinnest wall/strut in the part: small percentile of the distance from each boundary point to the
+    facing boundary (another loop, or the same loop far away along its length)."""
+    from scipy.spatial import cKDTree
+    loops = [np.asarray(part["poly"], float)] + [np.asarray(h, float) for h in part.get("poly_holes", [])]
+    for c, r in part.get("circles", []):
+        t = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+        loops.append(np.c_[c[0] + r * np.cos(t), c[1] + r * np.sin(t)])
+    perim = sum(np.linalg.norm(np.diff(np.vstack([L, L[:1]]), axis=0), axis=1).sum() for L in loops)
+    step = perim / n_pts
+    P, lid, s_arc = [], [], []
+    for k, L in enumerate(loops):
+        Lc = np.vstack([L, L[:1]])
+        seg = np.linalg.norm(np.diff(Lc, axis=0), axis=1)
+        cum = np.r_[0, np.cumsum(seg)]
+        ss = np.arange(0, cum[-1], step)
+        P.append(np.c_[np.interp(ss, cum, Lc[:, 0]), np.interp(ss, cum, Lc[:, 1])])
+        lid.append(np.full(len(ss), k)); s_arc.append(np.c_[ss, np.full(len(ss), cum[-1])])
+    P, lid, s_arc = np.vstack(P), np.concatenate(lid), np.vstack(s_arc)
+    T = cKDTree(P)
+    d, j = T.query(P, k=min(40, len(P)))
+    best = np.full(len(P), np.inf)
+    for col in range(1, d.shape[1]):
+        jj = j[:, col]
+        other = lid[jj] != lid
+        ds = np.abs(s_arc[jj, 0] - s_arc[:, 0])
+        ds = np.minimum(ds, s_arc[:, 1] - ds)
+        far = (~other) & (ds > 4 * d[:, col] + 2 * step)
+        ok = (other | far) & (d[:, col] < best)
+        best[ok] = d[ok, col]
+    best = best[np.isfinite(best)]
+    return float(np.percentile(best, 5)) if len(best) else np.inf
+
+
 def solve_two_meshes(part, h_fine_div=40, h_coarse_div=20):
     """Built-in solver: refine corners and support/load ends to l/div, coarse then fine (factor 2)."""
     poly = part["poly"]
@@ -133,6 +167,7 @@ def solve_two_meshes(part, h_fine_div=40, h_coarse_div=20):
     hg = size / 15
     if verts:
         hg = min(hg, min(ells[i] for i in verts) / 2)
+    hg = min(hg, max(min_wall(part) / 3, size / 400))      # at least ~3 elements across the thinnest wall
     res = {}
     fixed_arcs, radial_arcs, bearing_arcs, splits = hole_fixture_arcs(part)
     for tag, div in (("coarse", h_coarse_div), ("fine", h_fine_div)):
@@ -202,7 +237,13 @@ def analyse(part, sols, model=None):
             row["note"] = ("idealised clamp or load edge - not a physical stress; "
                            "read stress away from it or model the real support")
         rows.append(row)
-    return pd.DataFrame(rows)
+    cols = ["vertex", "label", "x", "y", "angle_deg", "fe_stress_coarse", "fe_stress_fine", "refine_ratio",
+            "singular", "ell", "type", "note"]
+    df = pd.DataFrame(rows)
+    for c in cols:
+        if c not in df:
+            df[c] = pd.Series(dtype=bool if c == "singular" else float if c not in ("label", "type", "note") else object)
+    return df
 
 
 def hole_profile(sol, c, r):

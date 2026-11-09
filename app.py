@@ -331,8 +331,10 @@ def result_figure(part, sols, flags, regular, hole_summary=(), mat=None):
                     textcoords="offset points", fontsize=8, color=FG, family=mono, bbox=box, ha="right")
     v, p = regular["fine"]
     ax.plot(*p, "s", ms=9, mfc="none", mec=FG, mew=1.6)
-    ax.annotate(f"MAX ELSEWHERE {v:.0f} MPA", p, xytext=(12, 10), textcoords="offset points", fontsize=9,
-                color=FG, family=mono, bbox=box, zorder=5)
+    right_half = p[0] > (m.p[0].min() + m.p[0].max()) / 2
+    ax.annotate(f"MAX ELSEWHERE {v:.0f} MPA", p, xytext=(-12, 10) if right_half else (12, 10),
+                textcoords="offset points", fontsize=9, color=FG, family=mono, bbox=box, zorder=5,
+                ha="right" if right_half else "left")
     ax.plot([], [], "o", ms=10, mfc="none", mec=C_SING, mew=2, label="SHARP CORNER · REAL STRESS PREDICTED")
     ax.plot([], [], "o", ms=10, mfc="none", mec="#8c8c8c", mew=2, label="SUPPORT / LOAD ARTEFACT")
     ax.plot([], [], "s", ms=9, mfc="none", mec=FG, mew=1.6, label="MAX CONVERGED STRESS ELSEWHERE")
