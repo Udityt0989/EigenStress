@@ -50,7 +50,12 @@ Options:
 - `--exec "C:\Program Files\ANSYS Inc\v251\ansys\bin\winx64\ANSYS251.exe"` – if PyMAPDL cannot find ANSYS.
 - A line "seed N failed: …" is fine now and then (that part is skipped). If **every** seed fails, send the message.
 
-## 4. If something goes wrong
+## 4. Use your own ANSYS models in the app
+`run_app.bat` starts the app. In the sidebar choose **Stresses from → ANSYS results**, upload the DXF of the part
+and its ANSYS result (`file.rst` from `<project>_files\dp0\SYS\MECH\`, or a CSV export). Upload a second result
+with a coarser mesh to confirm singularities by refinement. 2D or 3D plate models, any origin, mm or m units.
+
+## 5. If something goes wrong
 - `ansys-mapdl-core` cannot start MAPDL → use the `--exec` option above (check the path on your PC), and make sure no other ANSYS session holds the licence.
 - Any Python error → send a screenshot of the full red text.
 

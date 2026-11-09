@@ -593,6 +593,22 @@ with st.sidebar:
     up = st.file_uploader("Upload a 2D drawing (DXF)", type=["dxf"])
     sample_names = sorted(p.stem for p in SAMPLES.glob("*.dxf"))
     sample = st.selectbox("…or try a sample", ["—"] + sample_names, index=0 if up else 1)
+    src = st.radio("Stresses from", ["builtin", "ansys"], horizontal=True,
+                   format_func={"builtin": "Built-in solver", "ansys": "ANSYS results"}.get, key="src",
+                   help="ANSYS results: upload the result file of the same part (.rst, or a CSV with X, Y, SX, SY, "
+                        "SXY) and EigenStress analyses ANSYS's own stress field. Supports and loads then come "
+                        "from your ANSYS model.")
+    ans_f = ans_c = None
+    if src == "ansys":
+        _af = st.file_uploader("ANSYS result, fine mesh (.rst / .csv)", type=["rst", "csv", "txt"], key="ans_f",
+                               help="Workbench: <project>_files/dp0/SYS/MECH/file.rst. 2D or 3D plate models; "
+                                    "the face matching the DXF is found automatically.")
+        _ac = st.file_uploader("ANSYS result, coarse mesh (optional)", type=["rst", "csv", "txt"], key="ans_c",
+                               help="Same model with about twice the element size at the corners. With both, "
+                                    "singular points are confirmed by mesh refinement; with one, every sharp "
+                                    "re-entrant corner is treated as singular from its geometry.")
+        ans_f = (_af.getvalue(), _af.name) if _af else None
+        ans_c = (_ac.getvalue(), _ac.name) if _ac else None
     scale = st.number_input("Drawing units → mm (multiply by)", value=1.0, min_value=1e-6, format="%g",
                             help="1 if the DXF is in mm, 25.4 if in inches, 1000 if in metres")
     st.header("02 · Material")
@@ -610,6 +626,19 @@ with st.sidebar:
     n_ro = st.number_input("Hardening exponent n (Ramberg-Osgood)", value=0.15, min_value=0.02, max_value=0.5,
                           format="%g", help="~0.1-0.2 for steels and aluminium alloys. Only used above yield.") \
         if plast else 0.15
+    st.header("Design checks")
+    sf = st.number_input("Safety factor on yield", value=1.5, min_value=1.0, step=0.1, format="%g",
+                         help="Allowable stress = σy / safety factor. Every sharp corner gets the smallest fillet "
+                              "radius that keeps its real peak stress below this.")
+    su = st.number_input("Ultimate strength σu (MPa)", value=400.0, min_value=1.0, format="%g",
+                         help="For the fatigue check. Mild steel ~400, S355 ~510, 6061-T6 ~310.")
+    se_in = st.number_input("Endurance limit Se (MPa), 0 = auto", value=0.0, min_value=0.0, format="%g",
+                            help="Fatigue strength at 10⁶ cycles. 0 = 0.5 σu (polished steel). Lower it for rough "
+                                 "surfaces, size or reliability (e.g. 0.35-0.4 σu for machined parts).")
+    cycle = st.radio("Load cycle", ["R=-1", "R=0"], horizontal=True,
+                     format_func={"R=-1": "Reversed (±F)", "R=0": "On/off (0→F)"}.get,
+                     help="How the applied forces repeat in service: fully reversed (+F to −F) or zero to max.")
+    se = se_in if se_in > 0 else 0.5 * su
 
 # ------------------------------------------------------------------ geometry
 try:
@@ -840,14 +869,38 @@ with tab_an:
     # ------------------------------------------------------------------ run
     has_load = bool(loads) or any(b["type"] == "bearing" and any(b["F"]) for b in hole_bc.values())
     problem = support_problem(ss.supports, ss.hole_fix)
-    ready = has_load and problem is None
-    if problem:
-        st.markdown(f'<p class="eyebrow">→ {problem}</p>', unsafe_allow_html=True)
-    if not has_load:
-        st.markdown('<p class="eyebrow">→ Add a force on an edge, or a bearing load on a hole</p>', unsafe_allow_html=True)
-    run = st.button("Run analysis", type="primary", disabled=not ready)
+    ready = has_load and problem is None                     # (built-in solver; also gates the Optimise tab)
+    if src == "ansys":
+        st.markdown('<div class="note">ANSYS MODE → stresses come from your uploaded ANSYS result, so supports and '
+                    'forces are already in it. Marking supports in 03 is optional (their ends are then flagged as '
+                    'support artefacts instead of sharp corners).</div>', unsafe_allow_html=True)
+        if ans_f is None:
+            st.markdown('<p class="eyebrow">→ Upload the ANSYS result file in the sidebar (01 · Part)</p>',
+                        unsafe_allow_html=True)
+        run = st.button("Analyse ANSYS result", type="primary", disabled=ans_f is None)
+    else:
+        if problem:
+            st.markdown(f'<p class="eyebrow">→ {problem}</p>', unsafe_allow_html=True)
+        if not has_load:
+            st.markdown('<p class="eyebrow">→ Add a force on an edge, or a bearing load on a hole</p>', unsafe_allow_html=True)
+        run = st.button("Run analysis", type="primary", disabled=not ready)
 
-    if run:
+    if run and src == "ansys":
+        part = build_part(geom, edges, ss.supports, loads, thickness, E, nu, rho, hole_bc)
+        with st.spinner("Reading the ANSYS result…"):
+            try:
+                from ansys_io import sols_from_results
+                sols, info_ = sols_from_results(part, ans_f, ans_c)
+            except Exception as e:
+                st.error(f"Could not use the ANSYS result: {e}")
+                st.stop()
+        ss.results = {"part": part, "sols": sols,
+                      "used": ["ANSYS " + i_ for i_ in info_] +
+                              (["one result: sharp corners treated as singular from their geometry"]
+                               if sols.get("geometric_only") else [])}
+        ss.probes = []
+        ss.run_id = ss.get("run_id", 0) + 1
+    elif run:
         part = build_part(geom, edges, ss.supports, loads, thickness, E, nu, rho, hole_bc)
         with st.spinner("Meshing and solving at two mesh sizes…"):
             try:
@@ -878,8 +931,35 @@ with tab_an:
                   for v in flags["predicted_real_stress"]]
             flags["actual_after_yield"] = [x[0] for x in nb]
             flags["plastic_strain_pct"] = [100 * x[2] for x in nb]
+        # ---- design answers: required radius (sharp corners) + fatigue (every hot spot)
+        from design_tools import required_radius, fatigue, life_text
+        allow = sy / sf
+        req_r, req_s = [], []
+        for _, r_ in flags.iterrows():
+            fe_ = r_.get("feats")
+            if r_.get("type") == "sharp re-entrant corner" and isinstance(fe_, dict):
+                rr_, st_, _ = required_radius(model, fe_, allow)
+            else:
+                rr_, st_ = np.nan, ""
+            req_r.append(rr_)
+            req_s.append(st_)
+        flags["required_radius"] = req_r
+        flags["required_status"] = req_s
         sharp = flags[(flags.type == "sharp re-entrant corner")]
         artef = flags[(flags.type == "support / load artefact")]
+        fat_rows = []
+        for _, r_ in sharp.iterrows():
+            pk_ = r_.get("predicted_real_stress", np.nan)
+            if np.isfinite(pk_):
+                fz = fatigue(pk_, r_.get("nominal_stress", pk_), r_.corner_radius, su, se, cycle)
+                fat_rows.append({"where": f"{r_.label} · corner r {r_.corner_radius:g} mm", "peak": pk_, **fz})
+        for h_ in hole_summary:
+            fz = fatigue(h_["peak_stress"], h_["peak_stress"], h_["radius_mm"], su, se, cycle)
+            fat_rows.append({"where": f"{h_['hole']} · hole edge", "peak": h_["peak_stress"], **fz})
+        fz = fatigue(regular["fine"][0], regular["fine"][0], 1e3, su, se, cycle)
+        fat_rows.append({"where": "max elsewhere", "peak": regular["fine"][0], **fz})
+        fat = pd.DataFrame(fat_rows).sort_values("life_cycles", kind="stable").reset_index(drop=True) \
+            if fat_rows else pd.DataFrame()
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Sharp corners", len(sharp), help="Geometric singularities: the FE value there is not real.")
@@ -1027,12 +1107,30 @@ with tab_an:
                             yld = f'<div class="yl">ABOVE YIELD ({sy:g} MPa): the part yields locally here</div>'
                         else:
                             yld = f'<div class="yl">Below yield ({sy:g} MPa): elastic, prediction is the actual stress</div>'
+                    rq_, rs_ = r.get("required_radius", np.nan), r.get("required_status", "")
+                    if rs_ == "ok":
+                        req = (f'<div class="yl">REQUIRED RADIUS for ≤ {allow:.0f} MPa (σy/{sf:g}) → '
+                               f'<b>r ≥ {rq_:.2f} mm</b>' + (' · current radius is enough' if r.corner_radius >= rq_
+                                                              else ' · <b>increase the radius</b>') + '</div>')
+                    elif rs_ == "any":
+                        req = (f'<div class="yl">REQUIRED RADIUS for ≤ {allow:.0f} MPa → any radius ≥ {rq_:.2f} mm '
+                               'works (low-stress corner)</div>')
+                    elif rs_ == "impossible":
+                        req = (f'<div class="yl">REQUIRED RADIUS for ≤ {allow:.0f} MPa → <b>a fillet alone cannot '
+                               f'get there</b> (still above it at r = l = {r.ell:.1f} mm): add material or reduce '
+                               'the load here</div>')
+                    else:
+                        req = ""
                     st.markdown(
                         f'<div class="card"><div class="hd">{r.label} · sharp corner {r.angle_deg:.0f}°</div>'
-                        f'<div class="sg">SINGULARITY (FE value at the point) · {r.fe_stress_coarse:.0f} → '
-                        f'{r.fe_stress_fine:.0f} MPa as the mesh is halved (×{r.refine_ratio:.2f}). '
-                        f'Not a real stress: it keeps rising with every refinement.</div>'
-                        f'{ml_line}{yld}</div>', unsafe_allow_html=True)
+                        + (f'<div class="sg">SINGULARITY (FE value at the point) · {r.fe_stress_fine:.0f} MPa in the '
+                           f'ANSYS result. A sharp re-entrant corner (λ = {r.williams_lambda:.3f} < 1): theory says this '
+                           f'value grows without limit as the mesh is refined, so it is not a real stress. Upload a '
+                           f'coarse result too to see it rise.</div>' if sols.get("geometric_only") else
+                           f'<div class="sg">SINGULARITY (FE value at the point) · {r.fe_stress_coarse:.0f} → '
+                           f'{r.fe_stress_fine:.0f} MPa as the mesh is halved (×{r.refine_ratio:.2f}). '
+                           f'Not a real stress: it keeps rising with every refinement.</div>') +
+                        f'{ml_line}{yld}{req}</div>', unsafe_allow_html=True)
                 sharp = order.drop(columns="_k")
                 t = pd.DataFrame({
                     "point": list(sharp.label),
@@ -1040,6 +1138,9 @@ with tab_an:
                     "ML real (MPa)": sharp.get("predicted_real_stress", pd.Series(np.nan, index=sharp.index)).round(0),
                     "after yield": sharp.get("actual_after_yield", pd.Series(np.nan, index=sharp.index)).round(0),
                     "r (mm)": sharp.corner_radius,
+                    f"r needed ≤{allow:.0f}": [f"{x:.2f}" if s_ == "ok" else ("any" if s_ == "any" else
+                                               ("> l" if s_ == "impossible" else "—"))
+                                               for x, s_ in zip(sharp.required_radius, sharp.required_status)],
                 })
                 st.dataframe(t, hide_index=True, width="stretch")
                 st.caption("FE singular = what an FE contour shows at the corner (mesh-dependent, not real). ML real = "
@@ -1078,11 +1179,71 @@ with tab_an:
                 st.markdown(f'<div class="note">NOTE → max converged stress elsewhere ({v_f:.0f} MPa) is above yield '
                             f'({sy:g} MPa): the part yields there too.</div>', unsafe_allow_html=True)
 
+        if len(fat):
+            st.markdown("### Fatigue → where it cracks first")
+            top = fat.iloc[0]
+            st.markdown(
+                f'<div class="card"><div class="hd">Cracks first: {top["where"]}</div>'
+                f'<div class="ml">ESTIMATED LIFE ({"reversed ±F" if cycle == "R=-1" else "on/off 0→F"} at the '
+                f'applied load)<span class="big">{life_text(top.life_cycles)} cycles</span></div>'
+                f'<div class="yl">fatigue stress {top.fatigue_stress:.0f} MPa (Kf {top.Kf:.2f} from Kt {top.Kt:.2f}, '
+                f'notch sensitivity q {top.q:.2f}) · equivalent amplitude {top.eq_amplitude:.0f} MPa vs '
+                f'Se {se:.0f} MPa</div></div>', unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame({
+                "rank": range(1, len(fat) + 1), "where": fat["where"], "elastic peak": fat.peak.round(0),
+                "Kf/Kt": [f"{a:.2f}/{b:.2f}" for a, b in zip(fat.Kf, fat.Kt)],
+                "fatigue σ": fat.fatigue_stress.round(0), "life (cycles)": [life_text(x) for x in fat.life_cycles]}),
+                hide_index=True, width="stretch")
+            st.caption("Ranks every hot spot by fatigue life if the applied loads repeat. Sharp corners use the ML "
+                       "real peak, softened by Peterson's notch sensitivity (small radii hurt fatigue less than their "
+                       "peak suggests); holes and the max elsewhere use their converged peak. S-N line through "
+                       "0.9 σu at 10³ and Se at 10⁶ cycles, Goodman for on/off loading (Shigley). Steel-type "
+                       "estimate for comparing locations, not a certified life.")
+        # DXF with every sharp corner given its required radius (never below the real radius in the sidebar)
+        fix_r = {}
+        for _, r_ in sharp.iterrows():
+            if r_.required_status in ("ok", "any"):
+                fix_r[r_.label] = max(float(r_.required_radius), rho)
+        if fix_r:
+            from design_tools import apply_fillets, max_fillet
+            from sing_tool import part_holes as _ph
+            out_poly = [tuple(map(float, p)) for p in part["poly"]]
+            rv = {int(l_[1:]): r_ for l_, r_ in fix_r.items() if l_.startswith("V")}
+            rv = {i: min(r_, max_fillet(out_poly, i)) for i, r_ in rv.items()}
+            new_out = apply_fillets(out_poly, rv)
+            _, cw = _ph(part)
+            new_holes = []
+            for k_, ring_ in enumerate(cw):
+                rh = {int(l_.split(".")[1]): r_ for l_, r_ in fix_r.items() if l_.startswith(f"C{k_}.")}
+                rh = {i: min(r_, max_fillet(ring_, i)) for i, r_ in rh.items()}
+                new_holes.append(apply_fillets([tuple(map(float, p)) for p in ring_], rh))
+            import tempfile, os
+            from topopt import write_dxf as _wd
+            with tempfile.TemporaryDirectory() as td_:
+                pth = os.path.join(td_, "fixed.dxf")
+                _wd({"outline": new_out, "poly_holes": new_holes,
+                     "circles": [(tuple(c_), r_) for c_, r_ in part.get("circles", [])]}, pth)
+                dxf_bytes = open(pth, "rb").read()
+            st.download_button(f"Download DXF with required fillets ({len(fix_r)} corners, ≤ {allow:.0f} MPa)",
+                               dxf_bytes, file_name=f"{Path(name).stem}_required_fillets.dxf", width="stretch")
+            st.caption("Every sharp corner rounded to its required radius. Upload this DXF and run it to check: the "
+                       "fillets are drawn arcs, so the FE stresses there are real and converged.")
+
         rep = report_text(name, {"t": thickness, "E": E, "nu": nu}, sorted(ss.supports), loads, edges, flags, regular,
                           hole_bc, hole_summary, ss.forces)
+        rep += (f"\n\n## Design checks\nAllowable stress σy/SF = {sy:g}/{sf:g} = {allow:.0f} MPa.\n\n"
+                "| corner | ML real peak (MPa) at r | required radius (mm) |\n|---|---|---|\n" +
+                "".join(f"| {r_.label} | {r_.get('predicted_real_stress', np.nan):.0f} at {r_.corner_radius:g} mm | "
+                        f"{('%.2f' % r_.required_radius) if r_.required_status == 'ok' else r_.required_status} |\n"
+                        for _, r_ in sharp.iterrows()))
+        if len(fat):
+            rep += (f"\n## Fatigue ranking ({'fully reversed' if cycle == 'R=-1' else 'zero to max'}, σu {su:g} MPa, "
+                    f"Se {se:.0f} MPa)\n\n| rank | where | fatigue stress (MPa) | life (cycles) |\n|---|---|---|---|\n" +
+                    "".join(f"| {i + 1} | {r_['where']} | {r_.fatigue_stress:.0f} | {life_text(r_.life_cycles)} |\n"
+                            for i, r_ in fat.iterrows()))
         d1, d2 = st.columns(2)
         d1.download_button("Download report (Markdown)", rep, file_name=f"{Path(name).stem}_singularity_report.md")
-        d2.download_button("Download results (CSV)", flags.to_csv(index=False),
+        d2.download_button("Download results (CSV)", flags.drop(columns=["feats"], errors="ignore").to_csv(index=False),
                            file_name=f"{Path(name).stem}_singular_points.csv")
 
 

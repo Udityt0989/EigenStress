@@ -12,7 +12,7 @@ if not exist ".venv\Scripts\python.exe" (
     python -m venv ".venv" || goto :fail
 )
 ".venv\Scripts\python.exe" -m pip install --upgrade pip || goto :fail
-".venv\Scripts\python.exe" -m pip install -r requirements.txt ansys-mapdl-core || goto :fail
+".venv\Scripts\python.exe" -m pip install -r requirements.txt ansys-mapdl-core ansys-dpf-core ansys-mapdl-reader || goto :fail
 
 echo.
 echo Setup done. Next step (quick test, about 1 minute, starts ANSYS MAPDL in the background):

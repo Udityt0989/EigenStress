@@ -235,6 +235,35 @@ def node_value(xy, vm, P):
     return float(vm[np.argmin(np.linalg.norm(xy - P, axis=1))])
 
 
+def _nominal(sampler, ring, i, ell):
+    """'Nominal' stress for Kt / fatigue: the highest converged stress one feature length l from the corner,
+    read along both flank edges (just inside the material) and along the bisector. For a bent bracket this is
+    the bending stress in the flank, i.e. Peterson's net-section nominal stress."""
+    from corner_tools import material_bisector
+    P = np.asarray(ring[i], float)
+    e = material_bisector(ring, i)
+    n = len(ring)
+    vals = []
+    for nb in (np.asarray(ring[i - 1], float), np.asarray(ring[(i + 1) % n], float)):
+        t = nb - P
+        L = np.linalg.norm(t)
+        if L < 1e-12:
+            continue
+        d = min(ell, 0.9 * L)
+        q = P + d * t / L
+        q = q + 0.03 * d * _inward(ring, i, t / L, e)
+        vals.append(float(np.asarray(sampler(q)["vm"]).ravel()[0]))
+    vals.append(float(np.asarray(sampler(P + ell * e)["vm"]).ravel()[0]))
+    vals = [v for v in vals if np.isfinite(v)]
+    return max(vals) if vals else np.nan
+
+
+def _inward(ring, i, t, e):
+    """Unit normal to edge direction t pointing into the material (the side the bisector is on)."""
+    nrm = np.array([-t[1], t[0]])
+    return nrm if nrm @ e > 0 else -nrm
+
+
 def analyse(part, sols, model=None):
     poly = part["poly"]
     beta = interior_angles(poly)
@@ -245,12 +274,18 @@ def analyse(part, sols, model=None):
     rad_by = {int(k): v for k, v in part.get("corner_radius_by_vertex", {}).items()}
     c, f = sols["coarse"], sols["fine"]
     scale = np.abs(f["vm"]).max()
+    geo_only = bool(sols.get("geometric_only"))     # one external result: singular corners judged by geometry
     rows = []
-    for i in sorted(set(refine_vertices(part))):
+    cand = set(refine_vertices(part))
+    if f.get("external") and not geo_only:       # external (ANSYS) coarse + fine: supports / loads are inside the
+        cand = set(range(len(poly)))             # model, so check every outline vertex for a rising stress
+    for i in sorted(cand):
         P = poly[i]
         v_c, v_f = node_value(c["xy"], c["vm"], P), node_value(f["xy"], f["vm"], P)
         ratio = v_f / max(v_c, 1e-9)
         rising = ratio > RATIO_THRESHOLD and v_f > 1e-3 * scale
+        if geo_only:
+            rising = beta[i] > CANDIDATE_ANGLE and v_f > 1e-3 * scale
         ell = f.get("ell", {}).get(i) if isinstance(f.get("ell"), dict) else None
         if ell is None:
             ell = corner_length(poly, i, circles, poly_holes)
@@ -266,6 +301,8 @@ def analyse(part, sols, model=None):
             row["corner_radius"] = rho
             h = f["h"][i] if isinstance(f["h"], dict) else f["h"][i]
             feats = corner_features(f["sampler"], poly, i, h, ell=ell)
+            row["feats"] = feats
+            row["nominal_stress"] = _nominal(f["sampler"], poly, i, ell)
             notes = []
             if not (MODEL_BETA_RANGE[0] <= beta[i] <= MODEL_BETA_RANGE[1]):
                 notes.append("corner angle outside trained range (190-330 deg)")
@@ -294,6 +331,8 @@ def analyse(part, sols, model=None):
         v_c, v_f = node_value(c["xy"], c["vm"], P), node_value(f["xy"], f["vm"], P)
         ratio = v_f / max(v_c, 1e-9)
         rising = ratio > RATIO_THRESHOLD and v_f > 1e-3 * scale
+        if geo_only:
+            rising = v_f > 1e-3 * scale                  # cutout_corners() already returns only re-entrant ones
         row = {"vertex": np.nan, "label": f"C{k}.{i}", "x": P[0], "y": P[1], "angle_deg": round(b, 1),
                "fe_stress_coarse": v_c, "fe_stress_fine": v_f, "refine_ratio": ratio,
                "singular": bool(rising), "ell": ell}
@@ -308,6 +347,8 @@ def analyse(part, sols, model=None):
         hmap = f.get("hole_h", {}) or {}
         h = hmap.get((k, i), f["h"][0] if isinstance(f["h"], (list, tuple)) else min(f["h"].values()))
         feats = corner_features(f["sampler"], ring, i, h, ell=ell)
+        row["feats"] = feats
+        row["nominal_stress"] = _nominal(f["sampler"], ring, i, ell)
         notes = []
         if not (MODEL_BETA_RANGE[0] <= b <= MODEL_BETA_RANGE[1]):
             notes.append("corner angle outside trained range (190-330 deg)")
@@ -333,7 +374,7 @@ def hole_profile(sol, c, r):
     """Nodal von Mises stress around a hole: (angles in deg, stress), sorted by angle."""
     xy, vm = sol["xy"], sol["vm"]
     d = np.hypot(xy[:, 0] - c[0], xy[:, 1] - c[1])
-    on = np.abs(d - r) < 1e-6 * r + 1e-9
+    on = np.abs(d - r) < (1e-3 if sol.get("external") else 1e-6) * r + 1e-9
     ang = np.degrees(np.arctan2(xy[on, 1] - c[1], xy[on, 0] - c[0])) % 360
     o = np.argsort(ang)
     return ang[o], vm[on][o]
