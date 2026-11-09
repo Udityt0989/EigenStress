@@ -1077,14 +1077,20 @@ st.markdown('<p class="eyebrow">Topology optimisation (SIMP, minimum compliance)
 if not ready:
     st.markdown('<p class="eyebrow">→ Set supports and loads first (section 03)</p>', unsafe_allow_html=True)
 else:
-    o1, o2, o3 = st.columns(3)
+    o1, o2, o3, o4 = st.columns(4)
     vf = o1.slider("Material to keep", 0.15, 0.8, 0.4, 0.05, key="to_vf",
                    help="Fraction of the design area kept after optimisation.")
     res_q = o2.select_slider("Resolution", ["coarse", "medium", "fine"], value="medium", key="to_res",
-                             help="Finer = more detailed shape, slower (about 5-40 s).")
+                             help="Finer = more detailed shape, slower (about 10 s / 20 s / 40 s on a PC, longer online).")
     start = o3.radio("Start from", ["solid", "current"], key="to_start", horizontal=True,
                      format_func={"solid": "Solid outline", "current": "Current shape"}.get,
                      help="Solid outline ignores existing cutouts (bolt holes are always kept).")
+    fil_r = o4.number_input("Fillet radius on new shape (mm)", value=3.0, min_value=0.0, step=0.5, format="%g",
+                            key="to_fil",
+                            help="Every corner of the optimised shape is rounded with this radius, as you would "
+                                 "do in CAD before making it (no singularities left; the stress at each fillet is "
+                                 "then a real, converged FE value). 0 keeps sharp corners so EigenStress predicts "
+                                 "their real stress for the corner radius set in the sidebar.")
     if st.button("Optimise", key="to_run"):
         part0 = build_part(geom, edges, ss.supports, loads, thickness, E, nu, rho, hole_bc)
         if start == "solid":
@@ -1092,7 +1098,7 @@ else:
             part0["poly_holes"] = []
         from shapely.geometry import Polygon as _Pg
         design_area = _Pg(geom["outline"]).area - sum(np.pi * r_ ** 2 for _, r_ in geom["circles"])
-        n_target = {"coarse": 5000, "medium": 10000, "fine": 20000}[res_q]
+        n_target = {"coarse": 6000, "medium": 15000, "fine": 30000}[res_q]
         hsel = float(np.sqrt(max(design_area, 1e-9) / (0.43 * n_target)))   # ~equilateral triangles
         bar = st.progress(0.0, text="Optimising…")
 
@@ -1103,11 +1109,11 @@ else:
             if part0.get("poly_holes"):
                 hsel = min(hsel, max(min_wall(part0) / 2.5, hsel / 3))
             tres = optimise(part0, volfrac=vf, h=hsel, callback=cb)
-            tgeo, hmap = extract_shape(tres, part0)
+            tgeo, hmap = extract_shape(tres, part0, round_r=float(fil_r))
             if not tgeo.get("connected", True):
                 st.warning("The optimised layout splits into separate pieces at this resolution / material "
                            "fraction, so it cannot be analysed as one part. Try more material or a finer resolution.")
-            ss.topo = {"res": tres, "geo": tgeo, "hole_map": hmap, "part": part0, "vf": vf}
+            ss.topo = {"res": tres, "geo": tgeo, "hole_map": hmap, "part": part0, "vf": vf, "fil_r": float(fil_r)}
         except Exception as ex:
             st.error(f"Optimisation failed: {ex}")
         bar.empty()
@@ -1145,9 +1151,14 @@ else:
         axs.set_title(f"EXTRACTED SHAPE · {len(tgeo['poly_holes'])} CUTOUTS", color="#8c8c8c", fontsize=9,
                       family="monospace", loc="left")
         cB.pyplot(figs, width="stretch")
-        st.caption("The extracted shape keeps sharp corners where struts meet. Send it to EigenStress to see which "
-                   "of them are singular and what their real stress is for your machining radius, then fillet "
-                   "them in CAD.")
+        if ss.topo.get("fil_r", 0) > 0:
+            st.caption(f"The density field is smoothed into a clean outline and every corner is filleted with "
+                       f"r = {ss.topo['fil_r']:g} mm, so the new part has no stress singularities: EigenStress reports "
+                       "real, converged stresses at the fillets. Set the fillet radius to 0 to keep sharp corners "
+                       "and have EigenStress predict their real stress instead.")
+        else:
+            st.caption("Sharp corners kept where struts meet. Send it to EigenStress to see which are singular and "
+                       "what their real stress is for the corner radius in the sidebar.")
         import tempfile, os
         fd, tmpdxf = tempfile.mkstemp(suffix=".dxf"); os.close(fd)
         write_dxf(tgeo, tmpdxf)
@@ -1185,7 +1196,7 @@ with st.expander("How it works"):
         "3. **Classify.** Sharp re-entrant corners (angle > 190°) are geometric singularities. Ends of fixed or "
         "loaded edges are boundary-condition artefacts.\n"
         "4. **Predict.** The stresses at 0.1–0.3 l from each sharp corner converge on any reasonable mesh. "
-        "A model trained on ~74,000 sharp-vs-filleted FE pairs maps them, plus the real corner radius, to the "
+        "A model trained on ~91,000 sharp-vs-filleted FE pairs maps them, plus the real corner radius, to the "
         "finite peak stress.\n\n"
         "5. **Holes.** Each circular hole can be fixed (bolted), rest on a frictionless pin (radial contact on "
         "one half), or carry a bolt bearing load (cosine pressure on the loaded half). The hole edge is scanned "

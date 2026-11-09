@@ -176,11 +176,86 @@ def straighten(ring, max_dev, max_turn=25.0):
 
 
 
+def _resample(P, ds):
+    """Closed polyline -> points spaced about ds apart."""
+    P = np.asarray(P, float)
+    Q = np.vstack([P, P[:1]])
+    seg = np.linalg.norm(np.diff(Q, axis=0), axis=1)
+    s = np.concatenate([[0], np.cumsum(seg)])
+    n = max(int(np.ceil(s[-1] / ds)), 8)
+    t = np.linspace(0, s[-1], n, endpoint=False)
+    return np.column_stack([np.interp(t, s, Q[:, 0]), np.interp(t, s, Q[:, 1])])
+
+
+def _taubin(P, iters=30, lam=0.5, mu=-0.53):
+    """Taubin smoothing of a closed polyline: removes the element-size zig-zag without shrinking the shape."""
+    P = np.asarray(P, float).copy()
+    for _ in range(iters):
+        for f in (lam, mu):
+            P = P + f * (0.5 * (np.roll(P, 1, 0) + np.roll(P, -1, 0)) - P)
+    return P
+
+
+def fillet_ring(ring, r, max_turn=8.0):
+    """Replace every vertex where the boundary turns by more than ~1 degree with a circular arc of radius r
+    (reduced where the neighbouring edges are short). Arcs are split so no vertex turns by more than max_turn
+    degrees, so the result has no sharp corners left."""
+    P = [np.asarray(p, float) for p in ring]
+    n = len(P)
+    out = []
+    for i in range(n):
+        a, b, c = P[i - 1], P[i], P[(i + 1) % n]
+        u1, u2 = b - a, c - b
+        L1, L2 = np.linalg.norm(u1), np.linalg.norm(u2)
+        if L1 < 1e-12 or L2 < 1e-12:
+            continue
+        u1, u2 = u1 / L1, u2 / L2
+        cr = u1[0] * u2[1] - u1[1] * u2[0]
+        th = np.arctan2(cr, u1 @ u2)                     # signed turn angle
+        if abs(th) < np.radians(1.0):
+            out.append(b)
+            continue
+        tl = min(r * np.tan(abs(th) / 2), 0.45 * L1, 0.45 * L2)
+        re = tl / np.tan(abs(th) / 2)
+        p1 = b - tl * u1
+        nrm = np.array([-u1[1], u1[0]]) * np.sign(th)   # towards the arc centre
+        C = p1 + re * nrm
+        a0 = np.arctan2(p1[1] - C[1], p1[0] - C[0])
+        k = max(int(np.ceil(np.degrees(abs(th)) / max_turn)), 1)
+        for j in range(k + 1):
+            ang = a0 + th * j / k
+            out.append(C + re * np.array([np.cos(ang), np.sin(ang)]))
+    # drop near-duplicates
+    clean = [out[0]]
+    for q in out[1:]:
+        if np.linalg.norm(q - clean[-1]) > 1e-6:
+            clean.append(q)
+    if np.linalg.norm(clean[0] - clean[-1]) < 1e-6:
+        clean.pop()
+    return [tuple(p) for p in clean]
+
+
+def clean_ring(coords, h, round_r=0.0):
+    """Contour ring -> design boundary: resample, Taubin-smooth (removes the mesh zig-zag), simplify,
+    straighten mild kinks, then optionally round every remaining corner with radius round_r."""
+    from shapely.geometry import LinearRing
+    P = np.asarray(coords, float)
+    if np.allclose(P[0], P[-1]):
+        P = P[:-1]
+    P = _taubin(_resample(P, 0.5 * h))
+    rs = LinearRing(P).simplify(0.35 * h)
+    hr = straighten([tuple(p) for p in np.asarray(rs.coords)[:-1]], max_dev=1.0 * h, max_turn=30.0)
+    if round_r > 0 and len(hr) >= 3:
+        hr = fillet_ring(hr, round_r)
+    return hr
+
+
 def extract_shape(res, part, threshold=0.5, simplify=None, round_r=0.0):
     """
     Density field -> solid region (density >= threshold) as outline + cutouts.
     simplify : Douglas-Peucker tolerance (mm), default 0.6 h - removes the mesh staircase
-    round_r  : optional corner rounding radius (mm). 0 keeps sharp corners (for EigenStress to assess).
+    round_r  : corner rounding radius (mm): every corner becomes a circular fillet. 0 keeps sharp corners
+               (EigenStress then predicts their real stress for the chosen corner radius).
     Original bolt holes that survive are returned as exact circles (so fixtures can be re-applied).
     Returns geometry dict {outline, circles, poly_holes} + mapping old hole index -> new hole index.
     """
@@ -246,11 +321,6 @@ def extract_shape(res, part, threshold=0.5, simplify=None, round_r=0.0):
             geom = main
     if geom is None or geom.is_empty:
         raise ValueError("optimisation left no material above the threshold")
-    if round_r > 0:
-        geom = geom.buffer(round_r, join_style="round").buffer(-2 * round_r, join_style="round") \
-                   .buffer(round_r, join_style="round")
-        if geom.geom_type == "MultiPolygon":
-            geom = max(geom.geoms, key=lambda g: g.area)
     from shapely.geometry import LinearRing
     circles, _ = part_holes(part)
     min_area = (2.5 * h) ** 2
@@ -272,16 +342,14 @@ def extract_shape(res, part, threshold=0.5, simplify=None, round_r=0.0):
             new_circles.append(circles[matched])
             continue
         # 2) real cutouts: simplify + straighten each ring on its own
-        rs = LinearRing(ring.coords).simplify(simplify)
-        hr = straighten([tuple(p) for p in np.asarray(rs.coords)[:-1]], max_dev=1.2 * h)
+        hr = clean_ring(ring.coords, h, round_r)
         if len(hr) < 3 or Polygon(hr).area < min_area:
             continue
         hx = np.asarray(hr)
         if 0.5 * np.sum(hx[:, 0] * np.roll(hx[:, 1], -1) - np.roll(hx[:, 0], -1) * hx[:, 1]) > 0:
             hr = hr[::-1]                                          # cutouts clockwise
         poly_holes.append(hr)
-    ext = LinearRing(geom.exterior.coords).simplify(simplify)
-    outline = straighten([tuple(p) for p in np.asarray(ext.coords)[:-1]], max_dev=1.2 * h)
+    outline = clean_ring(geom.exterior.coords, h, round_r)
     # outline must be counter-clockwise for the solver
     xy = np.asarray(outline)
     if 0.5 * np.sum(xy[:, 0] * np.roll(xy[:, 1], -1) - np.roll(xy[:, 0], -1) * xy[:, 1]) < 0:
