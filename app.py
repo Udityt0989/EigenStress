@@ -527,6 +527,108 @@ def mesh_figure(m, flags, hole_summary, center=None, half=None, title=""):
     return fig
 
 
+def _corner_ring(part, r):
+    """Ring and vertex index for a flagged corner row (outline Vi or cutout Ck.i)."""
+    from sing_tool import part_holes
+    lab = str(r.label)
+    if lab.startswith("C"):
+        k, i = (int(v) for v in lab[1:].split("."))
+        return part_holes(part)[1][k], i
+    return part["poly"], int(r.vertex)
+
+
+def deformation_tab(part, sols, flags, thickness):
+    from deformation import DispSampler, corner_opening, deformation_summary
+    from views import deformed_figure, auto_exaggeration, outline_segments
+    summ = deformation_summary(sols)
+    if summ is None:
+        st.info("The uploaded ANSYS results carry stresses only. Export UX / UY as well to see deformation; "
+                "the built-in solver always has them.")
+        return
+    E, nu = part.get("E", 210000.0), part.get("nu", 0.3)
+    c, f = summ["coarse"], summ["fine"]
+    sharp = flags[flags.singular & (flags.type == "sharp re-entrant corner")]
+    rise = sharp.refine_ratio.max() if len(sharp) else np.nan
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Max |u| (mm)", f"{f['umax']:.3g}", f"{100 * (f['umax'] / c['umax'] - 1):+.2f} % on refining",
+              delta_color="off", help="Fine mesh; the change from the coarse mesh shows it has converged.")
+    d2.metric("Energy (N·mm)", f"{f['energy'] * thickness:.3g}",
+              f"{100 * (f['energy'] / c['energy'] - 1):+.2f} % on refining", delta_color="off",
+              help="U = ½ uᵀKu. Finite even at a sharp corner: the energy density ~ r^(2λ−2) is integrable.")
+    d3.metric("Corner stress", f"×{rise:.2f}" if np.isfinite(rise) else "—", "on refining", delta_color="off",
+              help="Same refinement, highest rise of a sharp-corner stress. Stress diverges; deformation does not.")
+    k1, k2, k3 = st.columns([2, 2, 1])
+    m_ = sols["fine"]["m"]
+    s_ = sols["fine"]["s"]
+    auto = auto_exaggeration(m_.p.T, np.hypot(s_["ux"], s_["uy"]))
+    mult = k1.number_input("Exaggeration (× auto)", min_value=0.0, value=1.0, step=0.5, key="def_mult",
+                           help=f"Auto = {auto:.3g}×, so the largest displacement is 8 % of the part size.")
+    show_mesh = k3.checkbox("Mesh", value=False, key="def_mesh")
+    from sing_tool import part_holes
+    rings = [part["poly"]] + list(part_holes(part)[1])
+    rings += [np.c_[cc[0] + rr * np.cos(np.linspace(0, 2 * np.pi, 60)), cc[1] + rr * np.sin(np.linspace(0, 2 * np.pi, 60))]
+              for cc, rr in part.get("circles", [])]
+    marks = [(r.x, r.y, r.label) for _, r in sharp.iterrows()]
+    st.pyplot(deformed_figure(m_.p.T, m_.t.T, s_["ux"], s_["uy"], auto * mult, outline_segments(rings),
+                              show_mesh, marks, title=f"DEFORMED SHAPE · ×{auto * mult:.3g}"), width="stretch")
+    rows = []
+    ds = {t: DispSampler(sols[t]["m"], sols[t]["s"]) for t in ("coarse", "fine")}
+    for _, r in sharp.iterrows():
+        try:
+            ring, i = _corner_ring(part, r)
+            oc = corner_opening(ds["coarse"], ring, i, r.ell, E, nu)
+            of = corner_opening(ds["fine"], ring, i, r.ell, E, nu)
+        except Exception:
+            oc = of = None
+        if not of:
+            continue
+        rows.append({"corner": r.label, "angle": f"{r.angle_deg:.0f}°",
+                     "K1 from displacement": f"{of['K1_u']:.4g}",
+                     "change on refining": f"{100 * (of['K1_u'] / oc['K1_u'] - 1):+.1f} %" if oc else "—",
+                     "stress change on refining": f"{100 * (r.refine_ratio - 1):+.0f} %",
+                     "λ from opening": f"{of['lam_u']:.3f}", "Williams λ": f"{of['lam']:.3f}",
+                     "flank opening at 0.1 l (µm)": f"{1000 * of['opening_at_01l']:.3g}"})
+    if rows:
+        st.markdown("**Corner intensity from deformation**")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption("Near a sharp corner the stress goes as r^(λ−1) (infinite) but the displacement as r^λ (finite). "
+               "The flank opening δ(r) between the two corner edges is fitted to a·r^λ + b·r + c·r² over "
+               "0.1–0.4 l; Williams' displacement field turns a into K1, in MPa·mm^(1−λ). Rigid motion and the "
+               "mode II part cancel in δ, so this is mode I only.")
+
+
+def photo_tab(part, sols, flags, thickness):
+    from deformation import grid_fields
+    from views import photo_controls, photo_panel
+    opts = photo_controls("ph", thickness)
+    m_ = sols["fine"]["m"]
+    g, ext = grid_fields(m_, sols["fine"]["s"], n_px=760)
+    ny, nx = g["sx"].shape
+    X, Y = np.meshgrid(np.linspace(ext[0], ext[1], nx), np.linspace(ext[2], ext[3], ny))
+    ok = ~singular_mask(np.c_[X.ravel(), Y.ravel()], flags, 0.3).reshape(X.shape)
+    sharp = flags[flags.singular]
+    top = sharp.assign(_k=sharp.get("predicted_real_stress", pd.Series(0.0, index=sharp.index)).fillna(0)) \
+        .sort_values("_k", ascending=False).head(5)
+    marks = [(r.x, r.y, r.label) for _, r in top.iterrows()]
+    F = sum(np.hypot(*fo["F"]) for fo in st.session_state.get("forces", [])) if st.session_state.get("forces") else 0.0
+    lf_holder = {}
+    rows = []
+    lf = photo_panel(g, ext, ok, opts, F, marks, (), title="SYNTHETIC PHOTOELASTICITY · " +
+                     ("CIRCULAR" if opts["pol"] == "circular" else "PLANE") + " POLARISCOPE")
+    for _, r in sharp[sharp.type == "sharp re-entrant corner"].iterrows():
+        pr = r.get("predicted_real_stress", np.nan)
+        rows.append({"corner": r.label,
+                     "fringe order at corner node, coarse → fine": f"{thickness * r.fe_stress_coarse * lf / opts['f']:.1f} → "
+                                                                  f"{thickness * r.fe_stress_fine * lf / opts['f']:.1f}",
+                     f"with the real radius": f"{thickness * pr * lf / opts['f']:.1f}" if np.isfinite(pr) else "—"})
+    if rows:
+        st.markdown("**Fringe order at the sharp corners**")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.caption("At a free edge σ2 = 0, so the fringe order is t·σ/f_σ. The sharp-corner count grows with "
+                   "every refinement (the model is wrong there); with the real radius it is finite and is "
+                   "what a photoelastic test of the real part would show.")
+
+
 def report_text(name, settings, supports, loads, edges, flags, regular, hole_bc=None, hole_summary=(), forces=()):
     hole_bc = hole_bc or {}
     hole_lines = []
@@ -586,31 +688,40 @@ for k, v in {"supports": set(), "forces": [], "hole_fix": {}, "geom_key": None, 
 
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
-    st.header("01 · Part")
-    if not SAMPLES.exists() or not any(SAMPLES.glob("*.dxf")):
-        SAMPLES.mkdir(exist_ok=True)
-        write_sample_dxfs(str(SAMPLES))
-    up = st.file_uploader("Upload a 2D drawing (DXF)", type=["dxf"])
-    sample_names = sorted(p.stem for p in SAMPLES.glob("*.dxf"))
-    sample = st.selectbox("…or try a sample", ["—"] + sample_names, index=0 if up else 1)
-    src = st.radio("Stresses from", ["builtin", "ansys"], horizontal=True,
-                   format_func={"builtin": "Built-in solver", "ansys": "ANSYS results"}.get, key="src",
-                   help="ANSYS results: upload the result file of the same part (.rst, or a CSV with X, Y, SX, SY, "
-                        "SXY) and EigenStress analyses ANSYS's own stress field. Supports and loads then come "
-                        "from your ANSYS model.")
-    ans_f = ans_c = None
-    if src == "ansys":
-        _af = st.file_uploader("ANSYS result, fine mesh (.rst / .csv)", type=["rst", "csv", "txt"], key="ans_f",
-                               help="Workbench: <project>_files/dp0/SYS/MECH/file.rst. 2D or 3D plate models; "
-                                    "the face matching the DXF is found automatically.")
-        _ac = st.file_uploader("ANSYS result, coarse mesh (optional)", type=["rst", "csv", "txt"], key="ans_c",
-                               help="Same model with about twice the element size at the corners. With both, "
-                                    "singular points are confirmed by mesh refinement; with one, every sharp "
-                                    "re-entrant corner is treated as singular from its geometry.")
-        ans_f = (_af.getvalue(), _af.name) if _af else None
-        ans_c = (_ac.getvalue(), _ac.name) if _ac else None
-    scale = st.number_input("Drawing units → mm (multiply by)", value=1.0, min_value=1e-6, format="%g",
-                            help="1 if the DXF is in mm, 25.4 if in inches, 1000 if in metres")
+    st.header("00 · Mode")
+    mode = st.radio("How to get the stresses", ["sur", "fe"], key="app_mode",
+                    format_func={"sur": "Instant: parametric surrogate", "fe": "Any drawing: DXF + FE"}.get,
+                    help="Instant: pick an L-bracket or stepped bar, type its dimensions, and a reduced-order "
+                         "model trained offline on FE gives stress, deformation and fringes in milliseconds. "
+                         "Any drawing: upload a DXF; FE runs on two meshes and the singular-corner model "
+                         "predicts the real peak at every sharp corner.")
+    up, sample, src, ans_f, ans_c, scale = None, "—", "builtin", None, None, 1.0
+    if mode == "fe":
+        st.header("01 · Part")
+        if not SAMPLES.exists() or not any(SAMPLES.glob("*.dxf")):
+            SAMPLES.mkdir(exist_ok=True)
+            write_sample_dxfs(str(SAMPLES))
+        up = st.file_uploader("Upload a 2D drawing (DXF)", type=["dxf"])
+        sample_names = sorted(p.stem for p in SAMPLES.glob("*.dxf"))
+        sample = st.selectbox("…or try a sample", ["—"] + sample_names, index=0 if up else 1)
+        src = st.radio("Stresses from", ["builtin", "ansys"], horizontal=True,
+                       format_func={"builtin": "Built-in solver", "ansys": "ANSYS results"}.get, key="src",
+                       help="ANSYS results: upload the result file of the same part (.rst, or a CSV with X, Y, SX, SY, "
+                            "SXY) and EigenStress analyses ANSYS's own stress field. Supports and loads then come "
+                            "from your ANSYS model.")
+        ans_f = ans_c = None
+        if src == "ansys":
+            _af = st.file_uploader("ANSYS result, fine mesh (.rst / .csv)", type=["rst", "csv", "txt"], key="ans_f",
+                                   help="Workbench: <project>_files/dp0/SYS/MECH/file.rst. 2D or 3D plate models; "
+                                        "the face matching the DXF is found automatically.")
+            _ac = st.file_uploader("ANSYS result, coarse mesh (optional)", type=["rst", "csv", "txt"], key="ans_c",
+                                   help="Same model with about twice the element size at the corners. With both, "
+                                        "singular points are confirmed by mesh refinement; with one, every sharp "
+                                        "re-entrant corner is treated as singular from its geometry.")
+            ans_f = (_af.getvalue(), _af.name) if _af else None
+            ans_c = (_ac.getvalue(), _ac.name) if _ac else None
+        scale = st.number_input("Drawing units → mm (multiply by)", value=1.0, min_value=1e-6, format="%g",
+                                help="1 if the DXF is in mm, 25.4 if in inches, 1000 if in metres")
     st.header("02 · Material")
     thickness = st.number_input("Thickness t (mm)", value=10.0, min_value=0.01)
     E = st.number_input("Young's modulus E (MPa)", value=210000.0, min_value=1.0, format="%g")
@@ -642,6 +753,18 @@ with st.sidebar:
                      format_func={"R=-1": "Reversed (±F)", "R=0": "On/off (0→F)"}.get,
                      help="How the applied forces repeat in service: fully reversed (+F to −F) or zero to max.")
     se = se_in if se_in > 0 else 0.5 * su
+
+if mode == "sur":
+    st.markdown('<p class="eyebrow">Real stress at sharp corners · deformation · photoelasticity</p>',
+                unsafe_allow_html=True)
+    st.title("EigenStress")
+    st.markdown('<p style="font-size:18px;max-width:680px;margin-top:-4px">Stress at a sharp corner is infinite in '
+                'theory and mesh-dependent in FE; deformation is not. EigenStress predicts the real stress, the '
+                'deformation and the photoelastic fringe pattern of a part from a surrogate model.</p>',
+                unsafe_allow_html=True)
+    from surrogate_app import surrogate_page
+    surrogate_page(thickness, E, sy, sf, su, se, cycle)
+    st.stop()
 
 # ------------------------------------------------------------------ geometry
 try:
@@ -987,7 +1110,8 @@ with tab_an:
 
         left, right = st.columns([3, 2], gap="large")
         with left:
-            tab_s, tab_c, tab_m = st.tabs(["Stress map", "Contours + probe", "Mesh"])
+            tab_s, tab_c, tab_d, tab_p, tab_m = st.tabs(["Stress map", "Contours + probe", "Deformation",
+                                                         "Photoelastic", "Mesh"])
             with tab_c:
                 mfine = sols["fine"]["m"]
                 fields = field_values(sols["fine"]["s"], part.get("E", 210000.0), part.get("nu", 0.3))
@@ -1094,6 +1218,10 @@ with tab_an:
                 st.caption("6-node quadratic triangles (like ANSYS PLANE183); drawn as their corner triangles. "
                            "The fine mesh halves the element size at every corner, support end and hole; "
                            "singular points are those whose stress keeps rising between the two.")
+            with tab_d:
+                deformation_tab(part, sols, flags, thickness)
+            with tab_p:
+                photo_tab(part, sols, flags, thickness)
         with right:
             st.markdown("### Sharp corners → real stress")
             if len(sharp):

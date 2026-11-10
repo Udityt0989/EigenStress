@@ -20,3 +20,6 @@ desktop.ini
 
 # built-in-solver validation scratch output (regenerate with: python ansys_validate.py --solver python --out py_out)
 py_out/
+
+# FE snapshot caches for the surrogate (large; regenerate with: python train_surrogate.py)
+surrogate_data_*.npz

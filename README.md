@@ -25,6 +25,40 @@ To share it online for free: push this folder to GitHub, then deploy `app.py` on
 
 For changing the UI or adding features, see **DEVELOPING.md**.
 
+## New: instant surrogate, deformation and photoelasticity
+
+**Two modes** (sidebar "00 · Mode"):
+- **Instant: parametric surrogate** (default). Pick an L-bracket or a stepped flat bar, type the dimensions,
+  fillet radius and forces. A POD-RBF reduced-order model trained offline on FE answers in ~50 ms with no FE
+  at run time: peak fillet stress, Kt, deflection, strain energy, required fillet, fatigue life, the stress
+  map, the deformed shape, synthetic photoelastic fringes and a 60-design fillet sweep. "Check against FE"
+  runs one real solve for comparison.
+- **Any drawing: DXF + FE**. The original EigenStress workflow, now with two extra result tabs:
+  *Deformation* (deformed shape, strain energy, K1 measured from the corner displacements) and
+  *Photoelastic* (fringe pattern from the stress-optic law, circular or plane polariscope, white or
+  monochromatic light).
+
+**Why deformation:** at a sharp corner the stress goes as r^(λ−1) (infinite) but the displacement as r^λ and
+the strain-energy density as r^(2λ−2), which is integrable. `deformation_study.py` refines the L-bracket
+corner 32× (l/5 → l/160): the corner stress rises ×5.2, the tip deflection changes 0.4 % and the strain
+energy 0.4 %, and K1 from the flank opening settles within 3 % from l/20 (the stress-based near-tip value
+needs l/80). Castigliano on the centre lines brackets the FE deflection: 0.593 mm (rigid joint) – 0.703 mm
+(flexible joint) vs FE 0.668 mm.
+
+**Why the surrogate is small:** linearity (Fx, Fy superpose exactly), dimensional analysis (σ ∝ F/tL,
+u ∝ F/tE) and Williams scaling of the fillet peak (σ ∝ ρ^(λ−1)) leave only the geometry ratios to learn;
+beam-theory scales are divided out before the POD.
+
+| Held-out FE runs | peak stress (mean / worst) | deflection | stress field (rel. L2) |
+|---|---|---|---|
+| L-bracket, 40 | 0.9–1.7 % / 10.5 % | 0.14 % | 2.2 % |
+| Stepped bar, 30 | 0.06 % / 0.3 % | 0.07 % | 4.0 % |
+
+Files: `surrogate.py` (families, POD-RBF model), `train_surrogate.py` (FE snapshots → `surrogate_*.npz`,
+`surrogate_validation.csv`), `surrogate_app.py` (the Instant page), `deformation.py` (Williams displacement
+field, K1 from displacement, photoelastic rendering), `views.py`, `deformation_study.py`
+(→ `deformation_study.csv`, `fig8_deformation.png`).
+
 ## Setup (command line only)
 ```
 pip install gmsh scikit-fem scikit-learn pandas matplotlib joblib scipy

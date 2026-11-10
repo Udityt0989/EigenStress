@@ -298,6 +298,7 @@ def solve_plane_stress(m, fixed_edges, traction_edges, E=E_STEEL, nu=NU_STEEL,
 
     f, D, Kpen = boundary_conditions(m, ib, e, fixed_edges, traction_edges, fixed_arcs, radial_arcs,
                                      bearing_arcs, E)
+    K_mat = K                                         # material stiffness only (no support springs)
     if Kpen is not None:
         K = K + Kpen
     if len(D):
@@ -325,4 +326,8 @@ def solve_plane_stress(m, fixed_edges, traction_edges, E=E_STEEL, nu=NU_STEEL,
         out[name] = acc / cnt
     out["vm"] = np.sqrt(out["sx"] ** 2 - out["sx"] * out["sy"] + out["sy"] ** 2 + 3 * out["txy"] ** 2)
     out["u"] = u
+    out["ux"] = u[ib.nodal_dofs[0]]                  # vertex displacements (mm)
+    out["uy"] = u[ib.nodal_dofs[1]]
+    out["energy"] = 0.5 * float(u @ (K_mat @ u))     # strain energy per unit thickness (N mm / mm)
+    out["work"] = 0.5 * float(f @ u)                 # external work / 2 (per unit thickness)
     return out
